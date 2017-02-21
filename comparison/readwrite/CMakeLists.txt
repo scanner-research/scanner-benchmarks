@@ -4,11 +4,13 @@ set(LIBRARIES
 
 add_executable(readwrite_test
   main.cpp
-  ${PROTO_SRCS}
-  $<TARGET_OBJECTS:util>)
+  ${PROTO_SRCS})
+
+target_include_directories(readwrite_test PUBLIC
+  "${Scanner_DIR}")
 
 target_link_libraries(readwrite_test
   "${LIBRARIES}"
   "${PUBLIC_LIBRARIES}"
-  "${SCANNER_LIBRARIES}"
-  "${PLATFORM_LINK_FLAGS}")
+  "${PLATFORM_LINK_FLAGS}"
+  "${Scanner_DIR}/build/libscanner.so")
