@@ -1,52 +1,20 @@
-from scannerpy import Database, DeviceType, ScannerException
-from timeit import default_timer as now
-import os
+#!/usr/bin/env python
 
-def clear_filesystem_cache():
-    os.system('sudo sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"')
+from __future__ import print_function
 
+if __name__ == '__main__':
+    p = argparse.ArgumentParser(description='Perform profiling tasks')
+    subp = p.add_subparsers(help='sub-command help')
+    # Bench
+    bench_p = subp.add_parser('bench', help='Run benchmarks')
+    bench_p.add_argument('test', type=str,
+                         help='Which benchmark to run')
+    bench_p.add_argument('output_directory', type=str,
+                         help='Where to output results')
+    bench_p.set_defaults(func=bench_main,
+                         test='all',
+                         output_directory='benchmark_results')
+    # Graphs
+    graphs_p = subp.add_parser('graphs', help='Generate graphs from bench')
+    graphs_p.set_defaults(func=graphs_main)
 
-def run_trial(db, tasks, op, config):
-    print('Running trial...')
-
-    clear_filesystem_cache()
-    start = now()
-    success = True
-    try:
-        [output_table] = db.run(tasks, op, force=True, **config)
-        prof = output_table.profiler()
-        t = now() - start
-        print('Trial succeeded, took {:.3f}s'.format(t))
-    except ScannerException:
-        t = now() - start
-        success = False
-        prof = None
-        print('Trial FAILED after {:.3f}s'.format(t))
-
-    return success, t, prof
-
-
-def histogram(db, ty=DeviceType.CPU):
-    return db.ops.Histogram(device=ty)
-
-
-def multi_gpu_benchmark():
-    db = Database()
-
-    video = '/bigdata/wcrichto/videos/movies/meanGirls.mp4'
-    num_gpus = [1, 2, 4]
-    pipelines = [
-        ('histogram', histogram(db, DeviceType.GPU))]
-
-    [input_table], _ = db.ingest_videos([('test', video)], force=True)
-    tasks = db.sampler().all([(input_table.name(), 'test_out')])
-
-    for gpu_count in num_gpus:
-        for (name, op) in pipelines:
-            s, t, p = run_trial(db, tasks, op, {
-                'pipeline_instances_per_node': gpu_count
-            })
-
-
-if __name__ == "__main__":
-    multi_gpu_benchmark()
