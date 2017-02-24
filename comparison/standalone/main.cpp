@@ -13,10 +13,8 @@
  * limitations under the License.
  */
 
-#include "scanner/util/queue.h"
-#include "scanner/util/util.h"
+#include "util/queue.h"
 
-#include "scanner/evaluators/caffe/net_descriptor.h"
 #include "caffe/blob.hpp"
 #include "caffe/data_transformer.hpp"
 

@@ -17,10 +17,13 @@ from timeit import default_timer as now
 import string
 import random
 import glob
-from scannerpy import Database, DeviceType, Config
+from scannerpy import Database, DeviceType
+from scannerpy.config import Config
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+SCANNER_DIR = os.path.join(SCRIPT_DIR, '..', 'scanner')
+COMPARISON_DIR = os.path.join(SCRIPT_DIR, 'comparison')
 DEVNULL = open(os.devnull, 'wb', 0)
 
 
@@ -78,7 +81,7 @@ def run_opencv_trial(video_file, gpus_per_node, batch_size):
     current_env = os.environ.copy()
     start = time.time()
     program_path = os.path.join(
-        SCRIPT_DIR, 'build/debug/comparison/opencv/opencv_compare')
+        COMPARISON_DIR, 'build/opencv/opencv_compare')
     p = subprocess.Popen([
         program_path,
         '--video_paths_file', video_file,
@@ -853,7 +856,7 @@ def standalone_benchmark(tests, frame_counts, wh):
         current_env = os.environ.copy()
         start = time.time()
         program_path = os.path.join(
-            SCRIPT_DIR, '../build/comparison/standalone/standalone_comparison')
+            COMPARISON_DIR, 'build/standalone/standalone_comparison')
         p = subprocess.Popen([
             program_path,
             '--input_type', input_type,
@@ -968,16 +971,12 @@ def scanner_benchmark(tests, frame_counts, wh):
     scanner_settings = {
         'db_path': db_dir,
         'node_count': 1,
-        'pus_per_node': 1,
         'work_item_size': 64,
         'tasks_in_queue_per_pu': 3,
         'force': True,
         'env': {}
     }
-    dataset_name = 'test'
-    raw_job = 'raw_job'
-    jpg_job = 'jpg_job'
-    video_job = 'base'
+    collection_name = 'test'
 
     # Histogram benchmarks
     hist_cpu = db.ops.Histogram(device=DeviceType.CPU)
@@ -1022,74 +1021,75 @@ def scanner_benchmark(tests, frame_counts, wh):
 
         os.system('rm -rf {}'.format(db_dir))
         # ingest data
-        result, _ = db.ingest('video', dataset_name, paths, scanner_settings)
-        assert(result)
+        collection, f = db.ingest_video_collection(collection_name, paths)
+        assert(len(f) == 0)
 
         stride = 30
-        scanner_settings['env']['SC_JOB_NAME'] = video_job
-        for op, pipeline, dev in operations:
+        for pipeline_name, ops, in operations:
             frames = frame_counts[test_name]
 
-            scanner_settings['env']['SC_DEVICE'] = dev
-            scanner_settings['use_pool'] = True
-            scanner_settings['pus_per_node'] = 1
-            if op == 'histogram_cpu':
-                scanner_settings['use_pool'] = False
-                scanner_settings['tasks_in_queue_per_pu'] = 2
-                if wh[test_name]['width'] == 640:
-                    scanner_settings['io_item_size'] = 2048
-                    scanner_settings['work_item_size'] = 1024
-                    scanner_settings['pus_per_node'] = 4
-                else:
-                    scanner_settings['io_item_size'] = 1024
-                    scanner_settings['work_item_size'] = 128
-                    scanner_settings['pus_per_node'] = 8
-            elif op == 'histogram_cpu_strided':
-                scanner_settings['env']['SC_STRIDE'] = str(stride)
-                scanner_settings['use_pool'] = False
-                scanner_settings['tasks_in_queue_per_pu'] = 2
-                if wh[test_name]['width'] == 640:
-                    scanner_settings['io_item_size'] = 2048
-                    scanner_settings['work_item_size'] = 1024
-                    scanner_settings['pus_per_node'] = 4
-                else:
-                    scanner_settings['io_item_size'] = 1024
-                    scanner_settings['work_item_size'] = 128
-                    scanner_settings['pus_per_node'] = 4
-            elif op == 'histogram_gpu':
-                if wh[test_name]['width'] == 640:
-                    scanner_settings['io_item_size'] = 2048
-                    scanner_settings['work_item_size'] = 1024
-                else:
-                    scanner_settings['io_item_size'] = 512
-                    scanner_settings['work_item_size'] = 128
-            elif op == 'histogram_gpu_strided':
-                scanner_settings['env']['SC_STRIDE'] = str(stride)
-                if wh[test_name]['width'] == 640:
-                    scanner_settings['io_item_size'] = 2048
-                    scanner_settings['work_item_size'] = 1024
-                else:
-                    scanner_settings['io_item_size'] = 512
-                    scanner_settings['work_item_size'] = 128
-            elif op == 'flow_cpu':
-                scanner_settings['use_pool'] = False
-                frames /= 20
-                scanner_settings['io_item_size'] = 16
-                scanner_settings['work_item_size'] = 16
-                scanner_settings['pus_per_node'] = 16
-            elif op == 'flow_gpu':
-                frames /= 20
-                scanner_settings['io_item_size'] = 256
-                # 96 hangs!
-                #scanner_settings['io_item_size'] = 96
-                scanner_settings['work_item_size'] = 64
-            elif op == 'caffe':
-                scanner_settings['io_item_size'] = 256
-                scanner_settings['work_item_size'] = 64
-            total, prof = run_trial(dataset_name, pipeline, op,
-                                    scanner_settings)
-            stats = generate_statistics(prof)
-            all_results[test_name][op].append(
+            use_pool = True
+            pipeline_instances_per_node = 1
+            # if op == 'histogram_cpu':
+            #     use_pool = False
+            #     pipeline_instances_per_node = 2
+            #     scanner_settings['tasks_in_queue_per_pu'] = 2
+            #     if wh[test_name]['width'] == 640:
+            #         scanner_settings['io_item_size'] = 2048
+            #         scanner_settings['work_item_size'] = 1024
+            #         scanner_settings['pus_per_node'] = 4
+            #     else:
+            #         scanner_settings['io_item_size'] = 1024
+            #         scanner_settings['work_item_size'] = 128
+            #         scanner_settings['pus_per_node'] = 8
+            # elif op == 'histogram_cpu_strided':
+            #     scanner_settings['env']['SC_STRIDE'] = str(stride)
+            #     scanner_settings['use_pool'] = False
+            #     scanner_settings['tasks_in_queue_per_pu'] = 2
+            #     if wh[test_name]['width'] == 640:
+            #         scanner_settings['io_item_size'] = 2048
+            #         scanner_settings['work_item_size'] = 1024
+            #         scanner_settings['pus_per_node'] = 4
+            #     else:
+            #         scanner_settings['io_item_size'] = 1024
+            #         scanner_settings['work_item_size'] = 128
+            #         scanner_settings['pus_per_node'] = 4
+            # elif op == 'histogram_gpu':
+            #     if wh[test_name]['width'] == 640:
+            #         scanner_settings['io_item_size'] = 2048
+            #         scanner_settings['work_item_size'] = 1024
+            #     else:
+            #         scanner_settings['io_item_size'] = 512
+            #         scanner_settings['work_item_size'] = 128
+            # elif op == 'histogram_gpu_strided':
+            #     scanner_settings['env']['SC_STRIDE'] = str(stride)
+            #     if wh[test_name]['width'] == 640:
+            #         scanner_settings['io_item_size'] = 2048
+            #         scanner_settings['work_item_size'] = 1024
+            #     else:
+            #         scanner_settings['io_item_size'] = 512
+            #         scanner_settings['work_item_size'] = 128
+            # elif op == 'flow_cpu':
+            #     scanner_settings['use_pool'] = False
+            #     frames /= 20
+            #     scanner_settings['io_item_size'] = 16
+            #     scanner_settings['work_item_size'] = 16
+            #     scanner_settings['pus_per_node'] = 16
+            # elif op == 'flow_gpu':
+            #     frames /= 20
+            #     scanner_settings['io_item_size'] = 256
+            #     # 96 hangs!
+            #     #scanner_settings['io_item_size'] = 96
+            #     scanner_settings['work_item_size'] = 64
+            # elif op == 'caffe':
+            #     scanner_settings['io_item_size'] = 256
+            #     scanner_settings['work_item_size'] = 64
+
+            success, total, prof = run_trial(db.all(collection),
+                                             ops, 'out', scanner_settings)
+            assert(success)
+            stats = prof.statistics()
+            all_results[test_name][pipeline_name].append(
                 {'results': (total, stats),
                  'frames': frames})
 
@@ -1122,7 +1122,7 @@ def peak_benchmark(tests, frame_counts, wh):
         current_env = os.environ.copy()
         start = time.time()
         program_path = os.path.join(
-            SCRIPT_DIR, '../build/comparison/peak/peak_comparison')
+            COMPARISON_DIR, 'build/peak/peak_comparison')
         p = subprocess.Popen([
             program_path,
             '--video_list_path', list_path,
@@ -1245,7 +1245,7 @@ def decode_sol(tests, frame_count):
         current_env = os.environ.copy()
         start = time.time()
         program_path = os.path.join(
-            SCRIPT_DIR, '../build/comparison/ocv_decode/ocv_decode')
+            COMPARISON_DIR, 'build/ocv_decode/ocv_decode')
         p = subprocess.Popen([
             program_path,
             '--decoder', ty,
@@ -1341,7 +1341,7 @@ def kernel_sol(tests):
         current_env = os.environ.copy()
         start = time.time()
         program_path = os.path.join(
-            SCRIPT_DIR, '../build/comparison/kernel_sol/kernel_sol')
+            COMPARISON_DIR, 'build/kernel_sol/kernel_sol')
         p = subprocess.Popen([
             program_path,
             '--operation', operation,
@@ -1624,14 +1624,15 @@ def micro_comparison_driver():
     }
     t = 'fight'
     if 0:
-        #standalone_caffe_compute(tests)
+        standalone_caffe_compute(tests)
         peak_caffe_compute(tests, frame_counts, frame_wh)
-        exit()
-
-
-
     #t = 'mean'
     t = 'fight'
+    standalone_results = standalone_benchmark(tests, frame_counts, frame_wh)
+    scanner_results = scanner_benchmark(tests, frame_counts, frame_wh)
+    peak_results = peak_benchmark(tests, frame_counts, frame_wh)
+    print('what')
+    exit(1)
     #peak_results = peak_benchmark(tests, frame_counts, frame_wh)
     #scanner_results = scanner_benchmark(tests, frame_wh)
     #peak_results = peak_benchmark(tests, frame_counts, frame_wh)
@@ -1741,13 +1742,15 @@ def micro_comparison_driver():
 
 BENCHMARKS = {
     'multi_gpu': multi_gpu_benchmark,
-    'standalone': standalone_benchmarks,
-    'scanner': scanner_benchmarks,
-    'peak': peak_benchmarks,
+    'standalone': standalone_benchmark,
+    'scanner': scanner_benchmark,
+    'peak': peak_benchmark,
 }
 
 
-def benchmark(args):
+def bench_main(args):
+    micro_comparison_driver()
+    exit()
     test = args.test
     out_dir = args.output_directory
     if test == 'all':

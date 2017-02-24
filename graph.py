@@ -740,5 +740,5 @@ def multi_node_scaling_chart(all_results):
         fig.savefig('multinode_{}.pdf'.format(pipeline), dpi=150)
 
 
-def graphs_main(args):
+def graph_main(args):
     graph_decode_rate_benchmark('decode_test.csv')
