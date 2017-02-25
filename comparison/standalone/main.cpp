@@ -13,10 +13,14 @@
  * limitations under the License.
  */
 
+#include "util/time.h"
 #include "util/queue.h"
+#include "util/net_descriptor.h"
 
+#include "caffe/net.hpp"
 #include "caffe/blob.hpp"
 #include "caffe/data_transformer.hpp"
+#include "caffe/common.hpp"
 
 #include <boost/program_options/options_description.hpp>
 #include <boost/program_options/variables_map.hpp>
@@ -24,7 +28,6 @@
 #include <boost/program_options/errors.hpp>
 
 #ifdef HAVE_CUDA
-#include "scanner/util/cuda.h"
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/cudawarping.hpp>
@@ -41,8 +44,6 @@ namespace po = boost::program_options;
 namespace cvc = cv::cuda;
 
 using namespace scanner;
-using scanner::NetDescriptor;
-using scanner::Queue;
 
 using WorkerFn= std::function<void(int, Queue<int64_t>&)>;
 
@@ -441,14 +442,11 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
   double save_time = 0;
 
   NetDescriptor descriptor;
-  {
-    std::ifstream net_file{NET_PATH};
-    descriptor = scanner::descriptor_from_net_file(net_file);
-  }
+  descriptor = descriptor_from_net_file(NET_PATH);
 
   // Set ourselves to the correct GPU
   cv::cuda::setDevice(gpu_device_id);
-  CU_CHECK(cudaSetDevice(gpu_device_id));
+  cudaSetDevice(gpu_device_id);
   caffe::Caffe::set_mode(caffe::Caffe::GPU);
   caffe::Caffe::SetDevice(gpu_device_id);
   std::unique_ptr<caffe::Net<float>> net;

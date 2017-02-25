@@ -22,6 +22,8 @@
 
 namespace scanner {
 
+using i32 = int;
+
 template <typename T>
 class Queue {
  public:

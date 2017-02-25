@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-#include "comparison/peak/peak_video_decoder.h"
+#include "peak_video_decoder.h"
 #include "scanner/util/cuda.h"
 #include "scanner/util/image.h"
 #include "scanner/util/queue.h"

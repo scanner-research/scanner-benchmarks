@@ -13,19 +13,18 @@
  * limitations under the License.
  */
 
-#include "comparison/peak/peak_video_decoder.h"
-#include "scanner/video/software/software_video_decoder.h"
+#include "peak_video_decoder.h"
 
-#include "scanner/util/queue.h"
-#include "scanner/util/util.h"
-#include "scanner/util/h264.h"
-#include "scanner/engine/halide_context.h"
+#include "util/queue.h"
+// #include "scanner/util/util.h"
+// #include "scanner/util/h264.h"
+// #include "scanner/engine/halide_context.h"
 
-#include "scanner/evaluators/caffe/net_descriptor.h"
+#include "util/net_descriptor.h"
 #include "caffe/blob.hpp"
 #include "caffe/data_transformer.hpp"
 
-#include "caffe_input_transformer_gpu/caffe_input_transformer_gpu.h"
+//#include "caffe_input_transformer_gpu/caffe_input_transformer_gpu.h"
 #include "HalideRuntimeCuda.h"
 
 #include <boost/program_options/options_description.hpp>

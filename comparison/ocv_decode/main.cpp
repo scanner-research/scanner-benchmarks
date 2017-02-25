@@ -13,8 +13,8 @@
  * limitations under the License.
  */
 
-#include "scanner/util/queue.h"
-#include "scanner/util/util.h"
+#include "util/time.h"
+#include "util/queue.h"
 
 #include <boost/program_options/options_description.hpp>
 #include <boost/program_options/variables_map.hpp>
@@ -22,7 +22,6 @@
 #include <boost/program_options/errors.hpp>
 
 #ifdef HAVE_CUDA
-#include "scanner/util/cuda.h"
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/cudawarping.hpp>
