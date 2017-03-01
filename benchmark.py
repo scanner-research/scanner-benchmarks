@@ -17,7 +17,8 @@ from timeit import default_timer as now
 import string
 import random
 import glob
-from scannerpy import Database, DeviceType
+from scannerpy import Database, DeviceType, ScannerException
+from scannerpy.stdlib import NetDescriptor
 from scannerpy.config import Config
 import numpy as np
 
@@ -31,6 +32,15 @@ def clear_filesystem_cache():
     os.system('sudo sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"')
 
 
+def make_db(opts):
+    config_path = opts['config_path'] if 'config_path' in opts else None
+    db_path = opts['db_path'] if 'db_path' in opts else None
+    config = Config(config_path)
+    if db_path is not None:
+        config.db_path = db_path
+    return Database(config=config)
+
+
 def run_trial(tasks, pipeline, collection_name, opts={}):
     print('Running trial: collection {:s} ...:'.format(collection_name))
     # Clear cache
@@ -39,7 +49,7 @@ def run_trial(tasks, pipeline, collection_name, opts={}):
     config = Config(config_path)
     if db_path is not None:
         config.db_path = db_path
-    db = scanner.Database(config=config)
+    db = Database(config=config)
     scanner_opts = {}
     def add_opt(s):
         if s in opts:
@@ -54,7 +64,7 @@ def run_trial(tasks, pipeline, collection_name, opts={}):
     prof = None
     try:
         clear_filesystem_cache()
-        out_collection = db.run(tasks, pipeline, collection_name,
+        out_collection = db.run(tasks, pipeline, collection_name, force=True,
                                 **scanner_opts)
         prof = out_collection.profiler()
         elapsed = now() - start
@@ -63,11 +73,11 @@ def run_trial(tasks, pipeline, collection_name, opts={}):
         t /= float(1e9)  # ns to s
         print('Trial succeeded: {:.3f}s elapsed, {:.3f}s effective'.format(
             elapsed, t))
-    except ScannerException:
+    except ScannerException as e:
         elapsed = now() - start
         success = False
         prof = None
-        print('Trial FAILED after {:.3f}s'.format(elapsed))
+        print('Trial FAILED after {:.3f}s: {:s}'.format(elapsed, str(e)))
         t = -1
     return success, t, prof
 
@@ -261,7 +271,6 @@ ffmpeg -i {input} -vf scale={scale} -c:v libx264 -x264opts \
     keyint={gop}:min-keyint={gop} -crf {crf} {output}
 """
 
-    db = scanner.Scanner()
     scanner_settings = {
         'force': True,
         'node_count': 1,
@@ -363,6 +372,7 @@ def multi_gpu_benchmark(tests, frame_counts, frame_wh):
         os.system('rm -rf {}'.format(db_path))
         print('Ingesting {}'.format(paths))
         # ingest data
+        db = make_db(scanner_settings)
         result, _ = db.ingest('video', dataset_name, paths, scanner_settings)
         if result is False:
             print('Failed to ingest')
@@ -892,49 +902,6 @@ def standalone_benchmark(tests, frame_counts, wh):
         for op in operations:
             all_results[test_name][op] = []
 
-        # # bmp
-        # os.system('rm -rf {}'.format(output_dir))
-        # os.system('mkdir {}'.format(output_dir))
-        # run_paths = []
-        # for p in paths:
-        #     base = os.path.basename(p)
-        #     run_path = os.path.join(output_dir, base)
-        #     os.system('mkdir -p {}'.format(run_path))
-        #     run_cmd(bmp_template, {
-        #         'input': p,
-        #         'output': run_path
-        #     })
-        #     meta = read_meta(run_path)
-        #     write_meta_file(run_path, meta)
-        #     run_paths.append(run_path)
-        # write_paths(run_paths)
-
-        # for op in operations:
-        #     all_results[test_name][op].append(
-        #         run_standalone_trial('bmp', paths_file, op))
-
-        # # # jpg
-        # os.system('rm -rf {}'.format(output_dir))
-        # os.system('mkdir {}'.format(output_dir))
-        # run_paths = []
-        # for p in paths:
-        #     base = os.path.basename(p)
-        #     run_path = os.path.join(output_dir, base)
-        #     os.system('mkdir -p {}'.format(run_path))
-        #     run_cmd(jpg_template, {
-        #         'input': p,
-        #         'output': run_path
-        #     })
-        #     meta = read_meta(run_path)
-        #     write_meta_file(run_path, meta)
-        #     run_paths.append(run_path)
-        # write_paths(run_paths)
-
-        # for op in operations:
-        #     all_results[test_name][op].append(
-        #         run_standalone_trial('jpg', paths_file, op))
-
-        # video
         for op in operations:
             os.system('rm -rf {}'.format(output_dir))
             os.system('mkdir {}'.format(output_dir))
@@ -963,12 +930,9 @@ def standalone_benchmark(tests, frame_counts, wh):
     return all_results
 
 
-def scanner_benchmark(tests, frame_counts, wh):
+def scanner_benchmark(video, total_frames, tests):
     db_dir = '/tmp/scanner_db'
-
-    db = scanner.Scanner()
-    db._db_path = db_dir
-    scanner_settings = {
+    default_scanner_settings = {
         'db_path': db_dir,
         'node_count': 1,
         'work_item_size': 64,
@@ -976,6 +940,7 @@ def scanner_benchmark(tests, frame_counts, wh):
         'force': True,
         'env': {}
     }
+    db = make_db(default_scanner_settings)
     collection_name = 'test'
 
     # Histogram benchmarks
@@ -984,11 +949,11 @@ def scanner_benchmark(tests, frame_counts, wh):
 
     # Optical flow benchmarks
     of_cpu = db.ops.OpticalFlow(device=DeviceType.CPU)
-    of_gpu = db.ops.Histogram(device=DeviceType.GPU)
+    of_gpu = db.ops.OpticalFlow(device=DeviceType.GPU)
 
     # Caffe benchmark
-    descriptor = NetDescriptor.from_file(db, 'features/googlenet.toml')
-    caffe_args = facenet_args.caffe_args
+    descriptor = NetDescriptor.from_file(db, 'nets/googlenet.toml')
+    caffe_args = db.protobufs.CaffeArgs()
     caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
     caffe_args.batch_size = 96
 
@@ -1003,98 +968,83 @@ def scanner_benchmark(tests, frame_counts, wh):
                     (table_input, ["frame_info"])],
             args=caffe_args,
             device=device_type)
+        return caffe
 
-    caffe_cpu = caffe_pipeline(device=DeviceType.CPU)
-    caffe_gpu = caffe_pipeline(device=DeviceType.GPU)
+    caffe_cpu = caffe_pipeline(DeviceType.CPU)
+    caffe_gpu = caffe_pipeline(DeviceType.GPU)
 
-    operations = [('flow_gpu', of_cpu),
-                  ('flow_cpu', of_gpu),
-                  ('histogram_cpu', hist_cpu),
-                  ('histogram_gpu', hist_gpu),
-                  ('caffe', caffe_gpu)]
+    # Multi-view stereo benchmark
 
-    all_results = {}
-    for test_name, paths in tests.iteritems():
-        all_results[test_name] = {}
-        for op, _, _  in operations:
-            all_results[test_name][op] = []
+    operations = {
+        'histogram_cpu': hist_cpu,
+        'histogram_gpu': hist_gpu,
+        'flow_cpu': of_cpu,
+        'flow_gpu': of_gpu,
+        'caffe': caffe_gpu,
+        'strided_hist_cpu': hist_cpu,
+        'strided_hist_gpu': hist_gpu,
+        'gather_hist_cpu': hist_cpu,
+        'gather_hist_gpu': hist_gpu,
+        'range_hist_cpu': hist_cpu,
+        'range_hist_gpu': hist_gpu,
+    }
 
-        os.system('rm -rf {}'.format(db_dir))
-        # ingest data
-        collection, f = db.ingest_video_collection(collection_name, paths)
-        assert(len(f) == 0)
+    os.system('rm -rf {}'.format(db_dir))
 
-        stride = 30
-        for pipeline_name, ops, in operations:
-            frames = frame_counts[test_name]
+    # ingest data
+    db = make_db(default_scanner_settings)
+    collection, f = db.ingest_video_collection(collection_name, [video])
+    assert(len(f) == 0)
 
-            use_pool = True
-            pipeline_instances_per_node = 1
-            # if op == 'histogram_cpu':
-            #     use_pool = False
-            #     pipeline_instances_per_node = 2
-            #     scanner_settings['tasks_in_queue_per_pu'] = 2
-            #     if wh[test_name]['width'] == 640:
-            #         scanner_settings['io_item_size'] = 2048
-            #         scanner_settings['work_item_size'] = 1024
-            #         scanner_settings['pus_per_node'] = 4
-            #     else:
-            #         scanner_settings['io_item_size'] = 1024
-            #         scanner_settings['work_item_size'] = 128
-            #         scanner_settings['pus_per_node'] = 8
-            # elif op == 'histogram_cpu_strided':
-            #     scanner_settings['env']['SC_STRIDE'] = str(stride)
-            #     scanner_settings['use_pool'] = False
-            #     scanner_settings['tasks_in_queue_per_pu'] = 2
-            #     if wh[test_name]['width'] == 640:
-            #         scanner_settings['io_item_size'] = 2048
-            #         scanner_settings['work_item_size'] = 1024
-            #         scanner_settings['pus_per_node'] = 4
-            #     else:
-            #         scanner_settings['io_item_size'] = 1024
-            #         scanner_settings['work_item_size'] = 128
-            #         scanner_settings['pus_per_node'] = 4
-            # elif op == 'histogram_gpu':
-            #     if wh[test_name]['width'] == 640:
-            #         scanner_settings['io_item_size'] = 2048
-            #         scanner_settings['work_item_size'] = 1024
-            #     else:
-            #         scanner_settings['io_item_size'] = 512
-            #         scanner_settings['work_item_size'] = 128
-            # elif op == 'histogram_gpu_strided':
-            #     scanner_settings['env']['SC_STRIDE'] = str(stride)
-            #     if wh[test_name]['width'] == 640:
-            #         scanner_settings['io_item_size'] = 2048
-            #         scanner_settings['work_item_size'] = 1024
-            #     else:
-            #         scanner_settings['io_item_size'] = 512
-            #         scanner_settings['work_item_size'] = 128
-            # elif op == 'flow_cpu':
-            #     scanner_settings['use_pool'] = False
-            #     frames /= 20
-            #     scanner_settings['io_item_size'] = 16
-            #     scanner_settings['work_item_size'] = 16
-            #     scanner_settings['pus_per_node'] = 16
-            # elif op == 'flow_gpu':
-            #     frames /= 20
-            #     scanner_settings['io_item_size'] = 256
-            #     # 96 hangs!
-            #     #scanner_settings['io_item_size'] = 96
-            #     scanner_settings['work_item_size'] = 64
-            # elif op == 'caffe':
-            #     scanner_settings['io_item_size'] = 256
-            #     scanner_settings['work_item_size'] = 64
+    results = {}
+    for test in tests:
+        name = test['name']
 
-            success, total, prof = run_trial(db.all(collection),
-                                             ops, 'out', scanner_settings)
-            assert(success)
-            stats = prof.statistics()
-            all_results[test_name][pipeline_name].append(
-                {'results': (total, stats),
-                 'frames': frames})
+        ops = operations[name]
+        settings = test['scanner_settings']
+        sampling = test['sampling']
 
-    print(all_results)
-    return all_results
+        results[name] = []
+
+        # Parse sampling
+        item_size = settings['item_size']
+        sampling_type = sampling[0]
+        print(sampling)
+        if sampling_type == 'all':
+            sampled_input = db.sampler().all(collection, item_size=item_size)
+            frames = total_frames
+        elif sampling_type == 'strided':
+            sampled_input = db.sampler().strided(collection,
+                                                 sampling[1],
+                                                 item_size=item_size)
+            frames = total_frames / sampling[1]
+        elif sampling_type == 'gather':
+            sampled_input = [db.sampler().gather(collection,
+                                                 sampling[1],
+                                                 item_size=item_size)]
+            frames = len(sampling[1])
+        elif sampling_type == 'range':
+            sampled_input = db.sampler().ranges(collection,
+                                                sampling[1],
+                                                item_size=item_size)
+            frames = sum(e - s for s, e in sampling[1])
+        else:
+            print('Not a valid sampling type:', sampling_type)
+            exit(1)
+
+        # Parse settings
+        opts = default_scanner_settings.copy()
+        opts.update(settings)
+        opts['work_item_size'] = 64
+        print('Running {:s}'.format(name))
+        #frame_factor = 50
+        success, total, prof = run_trial(sampled_input, ops, 'out', opts)
+        assert(success)
+        stats = prof.statistics()
+        results[name].append({'results': (total, stats), 'frames': frames})
+
+    print(video, results)
+    return results
 
 
 def peak_benchmark(tests, frame_counts, wh):
@@ -1602,6 +1552,160 @@ def caffe_benchmark_gpu_trials():
     print_caffe_trial_times('Caffe Throughput Benchmark', trial_settings, times)
 
 
+def single_node_comparison_benchmark():
+    tests = {
+        'kcam': ['/n/scanner/wcrichto.new/videos/kcam/20150308_205310_836.mp4'],
+        #'fight': ['/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'],
+        #'excalibur': ['/n/scanner/wrichto.new/videos/movies/excalibur.mp4'],
+        #'mean': ['/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'],
+    }
+    frame_counts = {'charade': 163430,
+                    'fight': 200158,
+                    'excalibur': 202275,
+                    'mean': 139301,
+                    'kcam': 52542,
+    }
+    frame_wh = {'charade': {'width': 1920, 'height': 1080},
+                'fight': {'width': 1920, 'height': 800},
+                'excalibur': {'width': 1920, 'height': 1080},
+                'mean': {'width': 640, 'height': 480},
+                'kcam': {'width': 1280, 'height': 720},
+    }
+
+
+    def make_gather_frames(total_frames):
+        return []
+
+    def make_video_interval(total_frames):
+        # A range 100th of the video every 10th of the video
+        return [
+            (f - (total_frames / 100), f)
+            for f in range(total_frames / 10, total_frames + 1,
+                           total_frames / 10)]
+
+    small_video = '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'
+    small_video_frames = 139301
+    small_samplings = {
+        'all': ('all',),
+        'strided_short': ('strided', 30),
+        'strided_long': ('strided', 300),
+        'gather': ('gather', []),
+        'range': ('range', make_video_interval(small_video_frames)),
+        'flow_cpu_all': ('range', [0, small_video_frames / 200]),
+        'flow_gpu_all': ('range', [0, small_video_frames / 20]),
+    }
+
+    large_video = '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'
+    large_video_frames = 200158
+    large_samplings = {
+        'all': ('all',),
+        'strided_short': ('strided', 30),
+        'strided_long': ('strided', 300),
+        'gather': ('gather', []),
+        'range': ('range', make_video_interval(small_video_frames)),
+        'flow_cpu_all': ('range', [0, small_video_frames / 200]),
+        'flow_gpu_all': ('range', [0, small_video_frames / 20]),
+    }
+
+    tests = [
+    # {'name': 'flow_cpu',
+    # 'sampling': 'flow_cpu_all',
+    #  'item_size': 4,
+    #  'settings': {
+    #      'cpu_pool': None
+    #  }},
+    # {'name': 'flow_gpu',
+    # 'sampling': 'flow_gpu_all',
+    #  'item_size': 1024,
+    #  'settings': {
+    #      'gpu_pool': '3G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'histogram_cpu',
+    #  'sampling': 'all',
+    #  'scanner_settings': {
+    #      'item_size': 512,
+    #      'cpu_pool': None,
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'histogram_gpu',
+    # 'sampling': 'all',
+    #  'scanner_settings': {
+    #      'item_size': 2048,
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'caffe',
+    # 'sampling': 'all',
+    #  'frame_factor': 1,
+    #  'item_size': 2048,
+    #  'settings': {
+    #      'gpu_pool': '4G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'strided_hist_cpu',
+    #  'ops': hist_gpu,
+    #  'frame_factor': 1,
+    #  'item_size': 2048,
+    #  'settings': {
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'strided_hist_cpu',
+    #  'ops': hist_cpu,
+    #  'frame_factor': 1,
+    #  'scanner_settings': {
+    #      'item_size': 2048,
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    {'name': 'strided_hist_gpu',
+     'sampling': 'strided_long',
+     'scanner_settings': {
+         'item_size': 2048,
+         'gpu_pool': '6G',
+         'pipeline_instances_per_node': 1
+     }},
+    # {'name': 'gather_hist_cpu',
+    #  'ops': hist_gpu,
+    #  'frame_factor': 1,
+    #  'scanner_settings': {
+    #      'item_size': 2048,
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'gather_hist_gpu',
+    #  'ops': hist_gpu,
+    #  'frame_factor': 1,
+    #  'scanner_settings': {
+    #      'item_size': 2048,
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'range_hist_cpu',
+    #  'ops': hist_gpu,
+    #  'frame_factor': 1,
+    #  'scanner_settings': {
+    #      'item_size': 2048
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }},
+    # {'name': 'range_hist_gpu',
+    #  'ops': hist_gpu,
+    #  'frame_factor': 1,
+    #  'item_size': 2048,
+    #  'scanner_settings': {
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }}
+    ]
+
+    stests = []
+    for t in tests:
+        t['sampling'] = small_samplings[t['sampling']]
+        stests.append(t)
+    scanner_benchmark(small_video, small_video_frames, stests)
+
 def micro_comparison_driver():
     #pose_reconstruction_graphs({})
     tests = {
@@ -1628,9 +1732,9 @@ def micro_comparison_driver():
         peak_caffe_compute(tests, frame_counts, frame_wh)
     #t = 'mean'
     t = 'fight'
-    standalone_results = standalone_benchmark(tests, frame_counts, frame_wh)
+    #standalone_results = standalone_benchmark(tests, frame_counts, frame_wh)
     scanner_results = scanner_benchmark(tests, frame_counts, frame_wh)
-    peak_results = peak_benchmark(tests, frame_counts, frame_wh)
+    #peak_results = peak_benchmark(tests, frame_counts, frame_wh)
     print('what')
     exit(1)
     #peak_results = peak_benchmark(tests, frame_counts, frame_wh)
@@ -1749,7 +1853,7 @@ BENCHMARKS = {
 
 
 def bench_main(args):
-    micro_comparison_driver()
+    single_node_comparison_benchmark()
     exit()
     test = args.test
     out_dir = args.output_directory
