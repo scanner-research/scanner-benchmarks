@@ -21,7 +21,7 @@ import seaborn as sns
 from PIL import Image
 import numpy as np
 
-NAIVE_COLOR = '#b0b0b0'
+NAIVE_COLOR = '#21838c'
 SCANNER_COLOR = '#F39948'
 SCANNER2_COLOR = '#E83127'
 PEAK_COLOR = '#FF7169'
@@ -403,8 +403,8 @@ def standalone_graphs(frame_counts, results):
         plt.savefig('standalone_' + test_name + '.pdf', dpi=150)
 
 
-def comparison_graphs(test_name,
-                      frame_counts, wh,
+def comparison_graphs(name,
+                      width, height,
                       standalone_results, scanner_results,
                       peak_results,
                       labels_on=True):
@@ -414,19 +414,30 @@ def comparison_graphs(test_name,
     fig = plt.figure(figsize=(w, h))
     if False:
         fig.suptitle("Microbenchmarks on {width}x{height} video".format(
-            width=wh[test_name]['width'],
-            height=wh[test_name]['height']))
+            width=width,
+            height=height))
     ax = fig.add_subplot(111)
     if labels_on:
         plt.ylabel("Speedup (over expert)")
     ax.xaxis.grid(False)
 
-    ops = ['histogram_cpu', 'histogram_gpu', 'flow_cpu', 'flow_gpu', 'caffe']
-    labels = ['HISTCPU', 'HISTGPU', 'FLOWCPU', 'FLOWGPU', 'DNN']
+    # ops = ['histogram_cpu', 'histogram_gpu',
+    #        'strided_hist_short_gpu', 'strided_hist_long_gpu',
+    #        'range_hist_gpu',
+    #        'flow_cpu', 'flow_gpu',
+    #        'caffe']
+    # labels = ['HISTCPU', 'HISTGPU',
+    #           'SHORT', 'LONG',
+    #           'RANGE',
+    #           'FLOWCPU', 'FLOWGPU',
+    #           'DNN']
+    ops = ['histogram_cpu', 'histogram_gpu',
+           'flow_cpu', 'flow_gpu',
+           'caffe']
+    labels = ['HISTCPU', 'HISTGPU',
+              'FLOWCPU', 'FLOWGPU',
+              'DNN']
 
-    standalone_tests = standalone_results[test_name]
-    scanner_tests = scanner_results[test_name]
-    peak_tests = peak_results[test_name]
     #for test_name, tests in results.iteritems():
     if 1:
         ys = []
@@ -439,12 +450,9 @@ def comparison_graphs(test_name,
         scanner_y = []
         peak_y = []
         for label in ops:
-            if label == 'flow_cpu':
-                frames /= 200.0
-            if label == 'flow_gpu':
-                frames /= 20.0
-
-            peak_sec, frames, timings = peak_tests[label][0]
+            v = peak_results[label][0]
+            frames = v['frames']
+            peak_sec, timings = v['results']
             p_fps = frames / peak_sec
             if peak_sec == -1:
                 peak_fps.append(0)
@@ -452,7 +460,9 @@ def comparison_graphs(test_name,
                 peak_fps.append(p_fps)
             peak_y.append(1.0)
 
-            sec, frames, timings = standalone_tests[label][0]
+            v = standalone_results[label][0]
+            frames = v['frames']
+            sec, timings = v['results']
             st_fps = frames / sec
             if sec == -1:
                 standalone_y.append(0)
@@ -461,7 +471,9 @@ def comparison_graphs(test_name,
                 standalone_y.append(st_fps / p_fps)
                 standalone_fps.append(st_fps)
 
-            sec, frames, timings = scanner_tests[label][0]
+            v = scanner_results[label][0]
+            frames = v['frames']
+            sec, timings = v['results']
             sc_fps = frames/sec
             if sec == -1:
                 scanner_y.append(0)
@@ -480,7 +492,7 @@ def comparison_graphs(test_name,
         ys.append(peak_y)
         print(ys)
 
-        x = np.arange(5) * 1.2
+        x = np.arange(len(ops)) * 1.3
 
         variants = ['Baseline', 'Scanner', 'HandOpt']
 
@@ -518,7 +530,7 @@ def comparison_graphs(test_name,
         plt.tight_layout()
         sns.despine()
 
-        name = 'comparison_' + test_name
+        name = 'comparison_' + name
         plt.savefig(name + '.png', dpi=150)
         plt.savefig(name + '.pdf', dpi=150)
         with open(name + '_results.txt', 'w') as f:
@@ -544,6 +556,53 @@ def comparison_graphs(test_name,
                     f.write('{:10f} |'.format(n[j]))
                 f.write('\n')
         plt.clf()
+
+
+def striding_comparison_graphs(strides, results, labels_on=True):
+    sns.set_style('ticks')
+    scale = 2.5
+    w = 3.33 * scale
+    h = 1.25 * scale
+    fig = plt.figure(figsize=(w, h))
+    if False:
+        fig.suptitle("Striding Comparison")
+    ax = fig.add_subplot(111)
+    if labels_on:
+        plt.ylabel("Speedup (over no striding)")
+    ax.xaxis.grid(False)
+
+    colors = [NAIVE_COLOR, SCANNER_COLOR, SCANNER2_COLOR]
+    #for test_name, tests in results.iteritems():
+    labels = [name for name, _ in results]
+    x = strides
+    handles = []
+    for (name, result), c in zip(results, colors):
+        base_time = result['1'][0]['results'][0]
+        y = []
+        for stride in strides:
+            time = result[str(stride)][0]['results'][0]
+            y.append(base_time / time)
+        h, = ax.plot(x, y, color=c)
+        handles.append(h)
+
+    #ax.plot(x, strides[1:], color=PEAK_COLOR)
+
+    #ax.set_xlim([0, 1.0])
+    ax.set_xticks(strides[1:])
+    ax.set_xticklabels(strides[1:])
+    #ax.set_ylim([0, strides[-1] * 1.1])
+    #ax.set_yticks(strides)
+    #ax.set_yticklabels(strides)
+    ax.yaxis.grid(False)
+    ax.xaxis.grid(False)
+    fig.tight_layout()
+    sns.despine()
+    fig.legend(handles, labels, loc='upper right')
+    name = 'striding_comparison'
+    fig.savefig('{:s}.png'.format(name), dpi=300)
+    fig.savefig('{:s}.pdf'.format(name), dpi=300)
+
+    plt.clf()
 
 
 def convert_time(d):

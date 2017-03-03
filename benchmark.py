@@ -21,6 +21,9 @@ from scannerpy import Database, DeviceType, ScannerException
 from scannerpy.stdlib import NetDescriptor
 from scannerpy.config import Config
 import numpy as np
+from pprint import pprint
+import graph
+import copy
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SCANNER_DIR = os.path.join(SCRIPT_DIR, '..', 'scanner')
@@ -948,8 +951,18 @@ def scanner_benchmark(video, total_frames, tests):
     hist_gpu = db.ops.Histogram(device=DeviceType.GPU)
 
     # Optical flow benchmarks
-    of_cpu = db.ops.OpticalFlow(device=DeviceType.CPU)
-    of_gpu = db.ops.OpticalFlow(device=DeviceType.GPU)
+    def of_pipeline(dt):
+        table_input = db.ops.Input()
+        of = db.ops.OpticalFlow(
+            inputs=[(table_input, ["frame", "frame_info"])],
+            device=dt)
+        disc = db.ops.Discard(
+            inputs=[(of, ["flow"])],
+            device=dt)
+        return disc
+
+    of_cpu = of_pipeline(DeviceType.CPU)
+    of_gpu = of_pipeline(DeviceType.GPU)
 
     # Caffe benchmark
     descriptor = NetDescriptor.from_file(db, 'nets/googlenet.toml')
@@ -983,6 +996,8 @@ def scanner_benchmark(video, total_frames, tests):
         'caffe': caffe_gpu,
         'strided_hist_cpu': hist_cpu,
         'strided_hist_gpu': hist_gpu,
+        'strided_hist_short_gpu': hist_gpu,
+        'strided_hist_long_gpu': hist_gpu,
         'gather_hist_cpu': hist_cpu,
         'gather_hist_gpu': hist_gpu,
         'range_hist_cpu': hist_cpu,
@@ -1041,9 +1056,11 @@ def scanner_benchmark(video, total_frames, tests):
         success, total, prof = run_trial(sampled_input, ops, 'out', opts)
         assert(success)
         stats = prof.statistics()
+        prof.write_trace(name + '.trace')
         results[name].append({'results': (total, stats), 'frames': frames})
 
-    print(video, results)
+    print(video)
+    pprint(results)
     return results
 
 
@@ -1166,6 +1183,82 @@ def peak_benchmark(tests, frame_counts, wh):
 
     print(all_results)
     return all_results
+
+
+def scanner_striding_test(video, total_frames, tests):
+    db_dir = '/tmp/scanner_db'
+    default_scanner_settings = {
+        'db_path': db_dir,
+        'node_count': 1,
+        'work_item_size': 64,
+        'tasks_in_queue_per_pu': 3,
+        'force': True,
+        'env': {}
+    }
+    db = make_db(default_scanner_settings)
+    collection_name = 'test'
+
+    # Histogram benchmarks
+    hist_gpu = db.ops.Histogram(device=DeviceType.GPU)
+
+    os.system('rm -rf {}'.format(db_dir))
+
+    # ingest data
+    db = make_db(default_scanner_settings)
+    collection, f = db.ingest_video_collection(collection_name, [video])
+    assert(len(f) == 0)
+
+    results = {}
+    for test in tests:
+        name = test['name']
+
+        ops = hist_gpu
+        settings = test['scanner_settings']
+        sampling = test['sampling']
+
+        results[name] = []
+
+        # Parse sampling
+        item_size = settings['item_size']
+        sampling_type = sampling[0]
+        print(sampling)
+        if sampling_type == 'all':
+            sampled_input = db.sampler().all(collection, item_size=item_size)
+            frames = total_frames
+        elif sampling_type == 'strided':
+            sampled_input = db.sampler().strided(collection,
+                                                 sampling[1],
+                                                 item_size=item_size)
+            frames = total_frames / sampling[1]
+        elif sampling_type == 'gather':
+            sampled_input = [db.sampler().gather(collection,
+                                                 sampling[1],
+                                                 item_size=item_size)]
+            frames = len(sampling[1])
+        elif sampling_type == 'range':
+            sampled_input = db.sampler().ranges(collection,
+                                                sampling[1],
+                                                item_size=item_size)
+            frames = sum(e - s for s, e in sampling[1])
+        else:
+            print('Not a valid sampling type:', sampling_type)
+            exit(1)
+
+        # Parse settings
+        opts = default_scanner_settings.copy()
+        opts.update(settings)
+        opts['work_item_size'] = 64
+        print('Running {:s}'.format(name))
+        #frame_factor = 50
+        success, total, prof = run_trial(sampled_input, ops, 'out', opts)
+        assert(success)
+        stats = prof.statistics()
+        prof.write_trace(name + '.trace')
+        results[name].append({'results': (total, stats), 'frames': frames})
+
+    print(video)
+    pprint(results)
+    return results
 
 
 def decode_sol(tests, frame_count):
@@ -1591,8 +1684,8 @@ def single_node_comparison_benchmark():
         'strided_long': ('strided', 300),
         'gather': ('gather', []),
         'range': ('range', make_video_interval(small_video_frames)),
-        'flow_cpu_all': ('range', [0, small_video_frames / 200]),
-        'flow_gpu_all': ('range', [0, small_video_frames / 20]),
+        'flow_cpu_all': ('range', [[0, small_video_frames / 100]]),
+        'flow_gpu_all': ('range', [[0, small_video_frames / 20]]),
     }
 
     large_video = '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'
@@ -1602,109 +1695,186 @@ def single_node_comparison_benchmark():
         'strided_short': ('strided', 30),
         'strided_long': ('strided', 300),
         'gather': ('gather', []),
-        'range': ('range', make_video_interval(small_video_frames)),
-        'flow_cpu_all': ('range', [0, small_video_frames / 200]),
-        'flow_gpu_all': ('range', [0, small_video_frames / 20]),
+        'range': ('range', make_video_interval(large_video_frames)),
+        'flow_cpu_all': ('range', [[0, large_video_frames / 20]]),
+        'flow_gpu_all': ('range', [[0, large_video_frames / 20]]),
     }
 
     tests = [
-    # {'name': 'flow_cpu',
-    # 'sampling': 'flow_cpu_all',
-    #  'item_size': 4,
-    #  'settings': {
-    #      'cpu_pool': None
-    #  }},
-    # {'name': 'flow_gpu',
-    # 'sampling': 'flow_gpu_all',
-    #  'item_size': 1024,
-    #  'settings': {
-    #      'gpu_pool': '3G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'histogram_cpu',
-    #  'sampling': 'all',
-    #  'scanner_settings': {
-    #      'item_size': 512,
-    #      'cpu_pool': None,
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'histogram_gpu',
-    # 'sampling': 'all',
-    #  'scanner_settings': {
-    #      'item_size': 2048,
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'caffe',
-    # 'sampling': 'all',
-    #  'frame_factor': 1,
-    #  'item_size': 2048,
-    #  'settings': {
-    #      'gpu_pool': '4G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'strided_hist_cpu',
-    #  'ops': hist_gpu,
-    #  'frame_factor': 1,
-    #  'item_size': 2048,
-    #  'settings': {
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'strided_hist_cpu',
-    #  'ops': hist_cpu,
-    #  'frame_factor': 1,
-    #  'scanner_settings': {
-    #      'item_size': 2048,
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    {'name': 'strided_hist_gpu',
-     'sampling': 'strided_long',
+    {'name': 'flow_cpu',
+     'sampling': 'flow_cpu_all',
+     'scanner_settings': {
+         'item_size': 16,
+         'cpu_pool': None,
+         'pipeline_instances_per_node': 16
+     }},
+        {'name': 'flow_gpu',
+         'sampling': 'flow_gpu_all',
+         'scanner_settings': {
+             'item_size': 1024,
+             'gpu_pool': '3G',
+             'pipeline_instances_per_node': 1
+         }},
+        {'name': 'histogram_cpu',
+         'sampling': 'all',
+         'scanner_settings': {
+             'item_size': 1024,
+             'cpu_pool': '32G',
+             'pipeline_instances_per_node': 16
+         }},
+        {'name': 'histogram_gpu',
+         'sampling': 'all',
+         'scanner_settings': {
+             'item_size': 2048,
+             'gpu_pool': '6G',
+             'pipeline_instances_per_node': 1
+         }},
+        {'name': 'caffe',
+         'sampling': 'all',
+         'scanner_settings': {
+             'item_size': 2048,
+             'gpu_pool': '4G',
+             'pipeline_instances_per_node': 1
+         }},
+        # {'name': 'strided_hist_cpu',
+        #  'sampling': 'strided_short',
+        #  'scanner_settings': {
+        #      'item_size': 2048,
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+        # {'name': 'strided_hist_cpu',
+        #  'ops': hist_cpu,
+        #  'frame_factor': 1,
+        #  'scanner_settings': {
+        #      'item_size': 2048,
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+    {'name': 'strided_hist_short_gpu',
+     'sampling': 'strided_short',
      'scanner_settings': {
          'item_size': 2048,
          'gpu_pool': '6G',
          'pipeline_instances_per_node': 1
      }},
-    # {'name': 'gather_hist_cpu',
-    #  'ops': hist_gpu,
-    #  'frame_factor': 1,
-    #  'scanner_settings': {
-    #      'item_size': 2048,
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'gather_hist_gpu',
-    #  'ops': hist_gpu,
-    #  'frame_factor': 1,
-    #  'scanner_settings': {
-    #      'item_size': 2048,
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'range_hist_cpu',
-    #  'ops': hist_gpu,
-    #  'frame_factor': 1,
-    #  'scanner_settings': {
-    #      'item_size': 2048
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }},
-    # {'name': 'range_hist_gpu',
-    #  'ops': hist_gpu,
-    #  'frame_factor': 1,
-    #  'item_size': 2048,
-    #  'scanner_settings': {
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }}
+        {'name': 'strided_hist_long_gpu',
+         'sampling': 'strided_long',
+         'scanner_settings': {
+             'item_size': 2048,
+             'gpu_pool': '6G',
+             'pipeline_instances_per_node': 1
+         }},
+        # {'name': 'gather_hist_cpu',
+        #  'ops': hist_gpu,
+        #  'frame_factor': 1,
+        #  'scanner_settings': {
+        #      'item_size': 2048,
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+        # {'name': 'gather_hist_gpu',
+        #  'ops': hist_gpu,
+        #  'frame_factor': 1,
+        #  'scanner_settings': {
+        #      'item_size': 2048,
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+        # {'name': 'range_hist_cpu',
+        #  'ops': hist_gpu,
+        #  'frame_factor': 1,
+        #  'scanner_settings': {
+        #      'item_size': 2048
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+    {'name': 'range_hist_gpu',
+     'sampling': 'range',
+     'scanner_settings': {
+         'item_size': 2048,
+         'gpu_pool': '6G',
+         'pipeline_instances_per_node': 1
+     }}
     ]
+
+    tests = [
+    {'name': 'flow_cpu',
+     'sampling': 'flow_cpu_all',
+     'scanner_settings': {
+         'item_size': 64,
+         'cpu_pool': None,
+         'pipeline_instances_per_node': 32
+     }}]
 
     stests = []
     for t in tests:
-        t['sampling'] = small_samplings[t['sampling']]
-        stests.append(t)
-    scanner_benchmark(small_video, small_video_frames, stests)
+        x = t.copy()
+        x['sampling'] = small_samplings[t['sampling']]
+        stests.append(x)
+
+    #scanner_results = scanner_benchmark(small_video, small_video_frames, stests)
+    scanner_results = {'caffe': [{'frames': 139301, 'results': (124.215575869, {'eval': {'caffe:net': '92.931810', 'caffe:transform_input': '10.751346', 'decode': '123.109152', 'evaluate': '105.083320', 'idle': '169.292046', 'init': '0.002564', 'memcpy': '0.111664', 'op_marshal': '0.199384', 'setup': '3.441307', 'task': '105.757011'}, 'load': {'idle': '249.801238', 'io': '4.098090', 'setup': '0.000026', 'task': '5.091766'}, 'save': {'idle': '265.077130', 'io': '2.716596', 'setup': '0.000023', 'task': '2.718703'}, 'total_time': '124.215576'})}], 'flow_cpu': [{'frames': 696, 'results': (13.034195915, {'eval': {'decode': '45.335426', 'evaluate': '165.289857', 'idle': '780.737544', 'init': '1.530940', 'op_marshal': '0.000214', 'setup': '2.700304', 'task': '165.330727'}, 'load': {'idle': '32.027327', 'io': '0.020475', 'setup': '0.000058', 'task': '0.762892'}, 'save': {'idle': '45.890137', 'io': '0.034020', 'setup': '0.000113', 'task': '0.039795'}, 'total_time': '13.034196'})}], 'flow_gpu': [{'frames': 6965, 'results': (45.439282773, {'eval': {'decode': '43.106413', 'evaluate': '45.140732', 'idle': '74.221661', 'init': '0.000686', 'memcpy': '0.009722', 'op_marshal': '0.014059', 'setup': '1.612254', 'task': '45.213637'}, 'load': {'idle': '53.903756', 'io': '0.244350', 'setup': '0.000059', 'task': '0.341566'}, 'save': {'idle': '105.342207', 'io': '0.288177', 'setup': '0.000010', 'task': '0.288527'}, 'total_time': '45.439283'})}], 'histogram_cpu': [{'frames': 139301, 'results': (32.297165602, {'eval': {'decode': '483.722451', 'evaluate': '408.317141', 'idle': '1074.992327', 'init': '2.765437', 'op_marshal': '0.002170', 'setup': '5.705983', 'task': '412.049338'}, 'load': {'idle': '20.057779', 'io': '5.851161', 'setup': '0.000032', 'task': '8.196627'}, 'save': {'idle': '83.579506', 'io': '0.861688', 'setup': '0.000069', 'task': '0.875858'}, 'total_time': '32.297166'})}], 'histogram_gpu': [{'frames': 139301, 'results': (33.553154557, {'eval': {'decode': '32.609033', 'evaluate': '14.324457', 'idle': '82.179450', 'init': '0.003078', 'memcpy': '0.106341', 'op_marshal': '0.201628', 'setup': '0.758748', 'task': '14.852671'}, 'load': {'idle': '78.701292', 'io': '3.914725', 'setup': '0.000020', 'task': '4.976457'}, 'save': {'idle': '85.108238', 'io': '1.875328', 'setup': '0.000112', 'task': '1.877589'}, 'total_time': '33.553155'})}], 'range_hist_gpu': [{'frames': 13930, 'results': (3.597061053, {'eval': {'decode': '3.302835', 'evaluate': '1.558980', 'idle': '35.531154', 'init': '0.000488', 'memcpy': '0.013573', 'op_marshal': '0.023253', 'setup': '0.149820', 'task': '1.613436'}, 'load': {'idle': '23.547049', 'io': '0.479616', 'setup': '0.000018', 'task': '0.612952'}, 'save': {'idle': '26.583728', 'io': '0.198355', 'setup': '0.000023', 'task': '0.198698'}, 'total_time': '3.597061'})}], 'strided_hist_long_gpu': [{'frames': 464, 'results': (3.716887399, {'eval': {'decode': '2.495283', 'evaluate': '0.056301', 'idle': '38.109545', 'init': '0.000893', 'memcpy': '0.003860', 'op_marshal': '0.004425', 'setup': '0.192161', 'task': '0.062307'}, 'load': {'idle': '10.001863', 'io': '0.824274', 'setup': '0.000027', 'task': '0.926700'}, 'save': {'idle': '13.622593', 'io': '0.025920', 'setup': '0.000119', 'task': '0.026030'}, 'total_time': '3.716887'})}], 'strided_hist_short_gpu': [{'frames': 4643, 'results': (28.891601876, {'eval': {'decode': '24.867581', 'evaluate': '0.497028', 'idle': '89.946550', 'init': '0.000483', 'memcpy': '0.007095', 'op_marshal': '0.017515', 'setup': '1.184723', 'task': '0.532347'}, 'load': {'idle': '20.007012', 'io': '5.262028', 'setup': '0.000045', 'task': '6.076579'}, 'save': {'idle': '74.641240', 'io': '0.068315', 'setup': '0.000005', 'task': '0.068445'}, 'total_time': '28.891602'})}]}
+    standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
+                          for k, v in scanner_results.iteritems()}
+    peak_results = scanner_results
+    graph.comparison_graphs('small', 640, 480, standalone_results, scanner_results,
+                            peak_results)
+
+    ltests = []
+    for t in tests:
+        x = t.copy()
+        x['sampling'] = large_samplings[t['sampling']]
+        ltests.append(x)
+
+    scanner_results = scanner_benchmark(large_video, large_video_frames, ltests)
+    #scanner_results = {'caffe': [{'frames': 200158, 'results': (435.417009556, {'eval': {'caffe:net': '133.468485', 'caffe:transform_input': '258.728724', 'decode': '433.395844', 'evaluate': '394.458044', 'idle': '501.945076', 'init': '0.002706', 'memcpy': '0.159120', 'op_marshal': '0.287858', 'setup': '4.555529', 'task': '395.459679'}, 'load': {'idle': '834.646811', 'io': '8.888973', 'setup': '0.000014', 'task': '11.284089'}, 'save': {'idle': '881.816857', 'io': '4.391589', 'setup': '0.000058', 'task': '4.394543'}, 'total_time': '435.417010'})}], 'flow_cpu': [{'frames': 1393, 'results': (107.269, {'eval': {'decode': '219.133559', 'evaluate': '1168.302351', 'idle': '2285.970730', 'init': '2.922672', 'op_marshal': '0.000060', 'setup': '2.365424', 'task': '1168.390835'}, 'load': {'idle': '20.038022', 'io': '0.082666', 'setup': '0.000042', 'task': '0.416600'}, 'save': {'idle': '153.042148', 'io': '0.005722', 'setup': '0.000843', 'task': '0.006521'}, 'total_time': '66.602660'})}], 'flow_gpu': [{'frames': 6965, 'results': (165.517797157, {'eval': {'decode': '157.755461', 'evaluate': '165.083624', 'idle': '194.313481', 'init': '0.000615', 'memcpy': '0.023921', 'op_marshal': '0.028010', 'setup': '1.788916', 'task': '165.177909'}, 'load': {'idle': '139.745307', 'io': '0.381288', 'setup': '0.000031', 'task': '0.487492'}, 'save': {'idle': '330.516962', 'io': '0.330057', 'setup': '0.000017', 'task': '0.330412'}, 'total_time': '165.517797'})}], 'histogram_cpu': [{'frames': 200158, 'results': (196.063520178, {'eval': {'decode': '2974.510456', 'evaluate': '2903.479715', 'idle': '3650.775328', 'init': '1.855995', 'op_marshal': '0.003225', 'setup': '9.740384', 'task': '2906.387613'}, 'load': {'idle': '20.044932', 'io': '13.094699', 'setup': '0.000012', 'task': '18.798995'}, 'save': {'idle': '410.683959', 'io': '0.901726', 'setup': '0.000057', 'task': '0.918671'}, 'total_time': '196.063520'})}], 'histogram_gpu': [{'frames': 200158, 'results': (212.759045273, {'eval': {'decode': '210.554455', 'evaluate': '40.633012', 'idle': '413.620578', 'init': '0.002574', 'memcpy': '0.236299', 'op_marshal': '0.448800', 'setup': '1.933014', 'task': '41.780361'}, 'load': {'idle': '413.341515', 'io': '9.167670', 'setup': '0.000025', 'task': '11.540432'}, 'save': {'idle': '440.917125', 'io': '2.527965', 'setup': '0.000013', 'task': '2.531425'}, 'total_time': '212.759045'})}], 'range_hist_gpu': [{'frames': 13930, 'results': (15.470490955, {'eval': {'decode': '15.007252', 'evaluate': '2.807952', 'idle': '57.974887', 'init': '0.000545', 'memcpy': '0.022520', 'op_marshal': '0.036840', 'setup': '0.218463', 'task': '2.889426'}, 'load': {'idle': '36.611417', 'io': '0.829372', 'setup': '0.000014', 'task': '1.005539'}, 'save': {'idle': '49.128137', 'io': '0.237561', 'setup': '0.000033', 'task': '0.240587'}, 'total_time': '15.470491'})}], 'strided_hist_long_gpu': [{'frames': 667, 'results': (83.648365171, {'eval': {'decode': '76.987508', 'evaluate': '0.140616', 'idle': '202.001004', 'init': '0.040956', 'memcpy': '0.004904', 'op_marshal': '0.006026', 'setup': '1.569928', 'task': '0.149030'}, 'load': {'idle': '10.002044', 'io': '4.149257', 'setup': '0.000027', 'task': '4.976019'}, 'save': {'idle': '93.588812', 'io': '0.025750', 'setup': '0.000072', 'task': '0.026424'}, 'total_time': '83.648365'})}], 'strided_hist_short_gpu': [{'frames': 6671, 'results': (212.162948942, {'eval': {'decode': '204.844343', 'evaluate': '1.292920', 'idle': '457.042288', 'init': '0.000492', 'memcpy': '0.012949', 'op_marshal': '0.023855', 'setup': '3.018403', 'task': '1.342122'}, 'load': {'idle': '20.008024', 'io': '10.930864', 'setup': '0.000015', 'task': '13.221638'}, 'save': {'idle': '380.174834', 'io': '0.144958', 'setup': '0.000033', 'task': '0.145794'}, 'total_time': '212.162949'})}]}
+    standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
+                          for k, v in scanner_results.iteritems()}
+    standalone_results['histogram_cpu'][0]['results'] = (1516.348484848, {})
+    standalone_results['histogram_gpu'][0]['results'] = (209.809224319, {})
+    standalone_results['flow_cpu'][0]['results'] = (716.195372751, {})
+    standalone_results['flow_gpu'][0]['results'] = (162.672109, {})
+    standalone_results['caffe'][0]['results'] = (1016.330196875, {})
+    peak_results = copy.deepcopy(scanner_results)
+    peak_results['histogram_cpu'][0]['results'] = (202.770002059 , {})
+    peak_results['histogram_gpu'][0]['results'] = (209.73 , {})
+    peak_results['flow_cpu'][0]['results'] = (53.517230781, {})
+    peak_results['flow_gpu'][0]['results'] = (162.672109524, {})
+    peak_results['caffe'][0]['results'] = (467.658878505, {})
+    graph.comparison_graphs('large', 1920, 800, standalone_results, scanner_results,
+                            peak_results)
+
+
+def striding_comparison_benchmark():
+    videos = [
+        ('oliver', '/n/scanner/apoms/videos/oliver_trump_720p.mp4',
+         52176),
+        ('kcam', '/n/scanner/wcrichto.new/videos/kcam/20150308_205310_836.mp4',
+         52542),
+        ('small', '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4',
+         139301),
+        ('large', '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4',
+         200158),
+    ]
+
+    strides = [1, 5, 15] + range(30, 391, 60)
+    tests = [{'name': '{:d}'.format(stride),
+              'sampling': ('strided', stride),
+              'scanner_settings': {
+                  'item_size': 128,
+                  'gpu_pool': '4G',
+                  'pipeline_instances_per_node': 1
+              }}
+             for stride in strides]
+
+    results = []
+    for name, video, frames in videos:
+        r = scanner_striding_test(video, frames, tests)
+        results.append((name, r))
+    pprint(results)
+    graph.striding_comparison_graphs(strides, results)
+
 
 def micro_comparison_driver():
     #pose_reconstruction_graphs({})
@@ -1853,7 +2023,8 @@ BENCHMARKS = {
 
 
 def bench_main(args):
-    single_node_comparison_benchmark()
+    #single_node_comparison_benchmark()
+    striding_comparison_benchmark()
     exit()
     test = args.test
     out_dir = args.output_directory
