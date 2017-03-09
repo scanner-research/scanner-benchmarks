@@ -89,7 +89,7 @@ void Queue<T>::pop(T& item) {
 }
 
 template <typename T>
-void Queue::clear() {
+void Queue<T>::clear() {
   std::unique_lock<std::mutex> lock(mutex_);
   data_.clear();
 
