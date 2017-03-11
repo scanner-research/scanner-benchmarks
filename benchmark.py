@@ -41,7 +41,7 @@ def make_db(opts):
     config = Config(config_path)
     if db_path is not None:
         config.db_path = db_path
-    return Database(config=config)
+    return Database(master='localhost:5001', workers=['localhost:5003'], config=config)
 
 
 def run_trial(tasks, pipeline, collection_name, opts={}):
@@ -52,7 +52,11 @@ def run_trial(tasks, pipeline, collection_name, opts={}):
     config = Config(config_path)
     if db_path is not None:
         config.db_path = db_path
-    db = Database(config=config)
+    workers = ['localhost']
+    if 'nodes' in opts:
+        workers = opts['nodes']
+    #db = Database(master='localhost:5001', workers=workers, config=config)
+    db = Database(master='localhost:5001', workers=['localhost:5003'], config=config)
     scanner_opts = {}
     def add_opt(s):
         if s in opts:
@@ -82,6 +86,7 @@ def run_trial(tasks, pipeline, collection_name, opts={}):
         prof = None
         print('Trial FAILED after {:.3f}s: {:s}'.format(elapsed, str(e)))
         t = -1
+    db.stop_cluster()
     return success, t, prof
 
 
@@ -835,9 +840,9 @@ def storage_benchmark():
     print(json.dumps(all_sizes))
 
 
-def standalone_benchmark(tests, frame_counts, wh):
+def standalone_benchmark(video, video_frames, tests):
     output_dir = '/tmp/standalone'
-    test_output_dir = '/tmp/outputs'
+    test_output_dir = '/tmp/standalone_outputs'
     paths_file = os.path.join(output_dir, 'paths.txt')
 
     def read_meta(path):
@@ -860,7 +865,7 @@ def standalone_benchmark(tests, frame_counts, wh):
             for p in paths[1:]:
                 f.write('\n' + p)
 
-    def run_standalone_trial(input_type, paths_file, operation):
+    def run_standalone_trial(input_type, paths_file, operation, frames, stride):
         print('Running standalone trial: {}, {}, {}'.format(
             input_type,
             paths_file,
@@ -874,7 +879,9 @@ def standalone_benchmark(tests, frame_counts, wh):
             program_path,
             '--input_type', input_type,
             '--paths_file', paths_file,
-            '--operation', operation
+            '--operation', operation,
+            '--frames', str(frames),
+            '--stride', str(stride),
         ], env=current_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         so, se = p.communicate()
         rc = p.returncode
@@ -893,44 +900,65 @@ def standalone_benchmark(tests, frame_counts, wh):
             elapsed = timings['total']
         return elapsed, timings
 
-    operations = ['histogram_cpu', 'histogram_gpu', 'flow_cpu', 'flow_gpu',
-                  'caffe']
-
     bmp_template = "ffmpeg -i {input} -start_number 0 {output}/frame%07d.bmp"
     jpg_template = "ffmpeg -i {input} -start_number 0 {output}/frame%07d.jpg"
 
-    all_results = {}
-    for test_name, paths in tests.iteritems():
-        all_results[test_name] = {}
-        for op in operations:
-            all_results[test_name][op] = []
+    operations = {
+        'histogram_cpu': 'histogram_cpu',
+        'histogram_gpu': 'histogram_gpu',
+        'flow_cpu': 'flow_cpu',
+        'flow_gpu': 'flow_gpu',
+        'caffe': 'caffe',
+        'gather_hist_cpu': 'histogram_cpu',
+        'gather_hist_gpu': 'histogram_gpu',
+    }
 
-        for op in operations:
-            os.system('rm -rf {}'.format(output_dir))
-            os.system('mkdir {}'.format(output_dir))
+    os.system('rm -rf {}'.format(output_dir))
+    os.system('mkdir {}'.format(output_dir))
 
-            run_paths = []
-            for p in paths:
-                base = os.path.basename(p)
-                run_path = os.path.join(output_dir, base)
-                os.system('cp {} {}'.format(p, run_path))
-                run_paths.append(run_path)
-            write_paths(run_paths)
+    run_paths = []
+    base = os.path.basename(video)
+    run_path = os.path.join(output_dir, base)
+    os.system('cp {} {}'.format(video, run_path))
+    run_paths.append(run_path)
+    write_paths(run_paths)
 
-            frames = frame_counts[test_name]
-            if op == 'flow_cpu':
-                frames /= 200
-            if op == 'flow_gpu':
-                frames /= 20
+    results = {}
+    for test in tests:
+        name = test['name']
 
-            os.system('rm -rf {}'.format(test_output_dir))
-            os.system('mkdir -p {}'.format(test_output_dir))
-            all_results[test_name][op].append(
-                {'results':run_standalone_trial('mp4', paths_file, op),
-                 'frames': frames})
+        test_type = None
+        for o, tt in operations.iteritems():
+            if name.startswith(o):
+                test_type = tt
+                break
+        assert(test_type is not None)
 
-    print(all_results)
-    return all_results
+        sampling = test['sampling']
+        results[name] = []
+
+        frames = video_frames
+        stride = 1
+        sampling_type = sampling[0]
+        if sampling_type == 'all':
+            frames = video_frames
+        elif sampling_type == 'range':
+            assert(len(sampling[1]) == 1)
+            assert(sampling[1][0][0] == 0)
+            frames = sampling[1][0][1]
+        elif sampling_type == 'strided':
+            frames = video_frames
+            stride = sampling[1]
+
+        os.system('rm -rf {}'.format(test_output_dir))
+        os.system('mkdir -p {}'.format(test_output_dir))
+        total, timings = run_standalone_trial('mp4', paths_file, test_type,
+                                              frames, stride)
+        results[name].append({'results': (total, timings),
+                              'frames': frames / stride})
+
+    print(results)
+    return results
 
 
 def scanner_benchmark(video, total_frames, tests):
@@ -938,7 +966,7 @@ def scanner_benchmark(video, total_frames, tests):
     default_scanner_settings = {
         'db_path': db_dir,
         'node_count': 1,
-        'work_item_size': 64,
+        'work_item_size': 96,
         'tasks_in_queue_per_pu': 3,
         'force': True,
         'env': {}
@@ -1007,15 +1035,24 @@ def scanner_benchmark(video, total_frames, tests):
     os.system('rm -rf {}'.format(db_dir))
 
     # ingest data
+    db.stop_cluster()
     db = make_db(default_scanner_settings)
-    collection, f = db.ingest_video_collection(collection_name, [video])
+    collection, f = db.ingest_video_collection(collection_name, [video],
+                                               force=True)
+    db.stop_cluster()
     assert(len(f) == 0)
 
     results = {}
     for test in tests:
         name = test['name']
 
-        ops = operations[name]
+        ops = None
+        for o, pipeline in operations.iteritems():
+            if name.startswith(o):
+                ops = pipeline
+                break
+        assert(ops is not None)
+
         settings = test['scanner_settings']
         sampling = test['sampling']
 
@@ -1050,7 +1087,7 @@ def scanner_benchmark(video, total_frames, tests):
         # Parse settings
         opts = default_scanner_settings.copy()
         opts.update(settings)
-        opts['work_item_size'] = 64
+        opts['work_item_size'] = 96
         print('Running {:s}'.format(name))
         #frame_factor = 50
         success, total, prof = run_trial(sampled_input, ops, 'out', opts)
@@ -1204,8 +1241,11 @@ def scanner_striding_test(video, total_frames, tests):
     os.system('rm -rf {}'.format(db_dir))
 
     # ingest data
+    db.stop_cluster()
     db = make_db(default_scanner_settings)
-    collection, f = db.ingest_video_collection(collection_name, [video])
+    collection, f = db.ingest_video_collection(collection_name, [video],
+                                               force=True)
+    db.stop_cluster()
     assert(len(f) == 0)
 
     results = {}
@@ -1646,26 +1686,6 @@ def caffe_benchmark_gpu_trials():
 
 
 def single_node_comparison_benchmark():
-    tests = {
-        'kcam': ['/n/scanner/wcrichto.new/videos/kcam/20150308_205310_836.mp4'],
-        #'fight': ['/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'],
-        #'excalibur': ['/n/scanner/wrichto.new/videos/movies/excalibur.mp4'],
-        #'mean': ['/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'],
-    }
-    frame_counts = {'charade': 163430,
-                    'fight': 200158,
-                    'excalibur': 202275,
-                    'mean': 139301,
-                    'kcam': 52542,
-    }
-    frame_wh = {'charade': {'width': 1920, 'height': 1080},
-                'fight': {'width': 1920, 'height': 800},
-                'excalibur': {'width': 1920, 'height': 1080},
-                'mean': {'width': 640, 'height': 480},
-                'kcam': {'width': 1280, 'height': 720},
-    }
-
-
     def make_gather_frames(total_frames):
         return []
 
@@ -1681,7 +1701,7 @@ def single_node_comparison_benchmark():
     small_samplings = {
         'all': ('all',),
         'strided_short': ('strided', 30),
-        'strided_long': ('strided', 300),
+        'strided_long': ('strided', 500),
         'gather': ('gather', []),
         'range': ('range', make_video_interval(small_video_frames)),
         'flow_cpu_all': ('range', [[0, small_video_frames / 100]]),
@@ -1693,10 +1713,10 @@ def single_node_comparison_benchmark():
     large_samplings = {
         'all': ('all',),
         'strided_short': ('strided', 30),
-        'strided_long': ('strided', 300),
+        'strided_long': ('strided', 500),
         'gather': ('gather', []),
         'range': ('range', make_video_interval(large_video_frames)),
-        'flow_cpu_all': ('range', [[0, large_video_frames / 20]]),
+        'flow_cpu_all': ('range', [[0, large_video_frames / 40]]),
         'flow_gpu_all': ('range', [[0, large_video_frames / 20]]),
     }
 
@@ -1751,19 +1771,19 @@ def single_node_comparison_benchmark():
         #      'gpu_pool': '6G',
         #      'pipeline_instances_per_node': 1
         #  }},
-    {'name': 'strided_hist_short_gpu',
-     'sampling': 'strided_short',
+    {'name': 'gather_hist_gpu',
+     'sampling': 'strided_long',
      'scanner_settings': {
-         'item_size': 2048,
-         'gpu_pool': '6G',
+         'item_size': 4096,
+         'gpu_pool': '4G',
          'pipeline_instances_per_node': 1
      }},
-        {'name': 'strided_hist_long_gpu',
+        {'name': 'gather_hist_cpu',
          'sampling': 'strided_long',
          'scanner_settings': {
-             'item_size': 2048,
-             'gpu_pool': '6G',
-             'pipeline_instances_per_node': 1
+             'item_size': 4,
+             'cpu_pool': '90G',
+             'pipeline_instances_per_node': 8
          }},
         # {'name': 'gather_hist_cpu',
         #  'ops': hist_gpu,
@@ -1789,23 +1809,40 @@ def single_node_comparison_benchmark():
         #      'gpu_pool': '6G',
         #      'pipeline_instances_per_node': 1
         #  }},
-    {'name': 'range_hist_gpu',
-     'sampling': 'range',
-     'scanner_settings': {
-         'item_size': 2048,
-         'gpu_pool': '6G',
-         'pipeline_instances_per_node': 1
-     }}
+    # {'name': 'range_hist_gpu',
+    #  'sampling': 'range',
+    #  'scanner_settings': {
+    #      'item_size': 2048,
+    #      'gpu_pool': '6G',
+    #      'pipeline_instances_per_node': 1
+    #  }}
     ]
 
-    tests = [
-    {'name': 'flow_cpu',
-     'sampling': 'flow_cpu_all',
-     'scanner_settings': {
-         'item_size': 64,
-         'cpu_pool': None,
-         'pipeline_instances_per_node': 32
-     }}]
+    # tests = [
+    # {'name': 'flow_cpu',
+    #  'sampling': 'flow_cpu_all',
+    #  'scanner_settings': {
+    #      'item_size': 64,
+    #      'cpu_pool': None,
+    #      'pipeline_instances_per_node': 32
+    #  }}]
+
+    # tests = [
+    #     {'name': 'gather_hist_gpu',
+    #      'sampling': 'strided_long',
+    #      'scanner_settings': {
+    #          'item_size': 4096,
+    #          'gpu_pool': '4G',
+    #          'pipeline_instances_per_node': 1
+    #      }},
+    #     {'name': 'gather_hist_cpu',
+    #      'sampling': 'strided_long',
+    #      'scanner_settings': {
+    #          'item_size': 4,
+    #          'cpu_pool': '90G',
+    #          'pipeline_instances_per_node': 8
+    #      }},
+    # ]
 
     stests = []
     for t in tests:
@@ -1818,8 +1855,8 @@ def single_node_comparison_benchmark():
     standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
                           for k, v in scanner_results.iteritems()}
     peak_results = scanner_results
-    graph.comparison_graphs('small', 640, 480, standalone_results, scanner_results,
-                            peak_results)
+    # graph.comparison_graphs('small', 640, 480, standalone_results, scanner_results,
+    #                         peak_results)
 
     ltests = []
     for t in tests:
@@ -1827,15 +1864,16 @@ def single_node_comparison_benchmark():
         x['sampling'] = large_samplings[t['sampling']]
         ltests.append(x)
 
+    standalone_results = standalone_benchmark(large_video, large_video_frames, ltests)
     scanner_results = scanner_benchmark(large_video, large_video_frames, ltests)
     #scanner_results = {'caffe': [{'frames': 200158, 'results': (435.417009556, {'eval': {'caffe:net': '133.468485', 'caffe:transform_input': '258.728724', 'decode': '433.395844', 'evaluate': '394.458044', 'idle': '501.945076', 'init': '0.002706', 'memcpy': '0.159120', 'op_marshal': '0.287858', 'setup': '4.555529', 'task': '395.459679'}, 'load': {'idle': '834.646811', 'io': '8.888973', 'setup': '0.000014', 'task': '11.284089'}, 'save': {'idle': '881.816857', 'io': '4.391589', 'setup': '0.000058', 'task': '4.394543'}, 'total_time': '435.417010'})}], 'flow_cpu': [{'frames': 1393, 'results': (107.269, {'eval': {'decode': '219.133559', 'evaluate': '1168.302351', 'idle': '2285.970730', 'init': '2.922672', 'op_marshal': '0.000060', 'setup': '2.365424', 'task': '1168.390835'}, 'load': {'idle': '20.038022', 'io': '0.082666', 'setup': '0.000042', 'task': '0.416600'}, 'save': {'idle': '153.042148', 'io': '0.005722', 'setup': '0.000843', 'task': '0.006521'}, 'total_time': '66.602660'})}], 'flow_gpu': [{'frames': 6965, 'results': (165.517797157, {'eval': {'decode': '157.755461', 'evaluate': '165.083624', 'idle': '194.313481', 'init': '0.000615', 'memcpy': '0.023921', 'op_marshal': '0.028010', 'setup': '1.788916', 'task': '165.177909'}, 'load': {'idle': '139.745307', 'io': '0.381288', 'setup': '0.000031', 'task': '0.487492'}, 'save': {'idle': '330.516962', 'io': '0.330057', 'setup': '0.000017', 'task': '0.330412'}, 'total_time': '165.517797'})}], 'histogram_cpu': [{'frames': 200158, 'results': (196.063520178, {'eval': {'decode': '2974.510456', 'evaluate': '2903.479715', 'idle': '3650.775328', 'init': '1.855995', 'op_marshal': '0.003225', 'setup': '9.740384', 'task': '2906.387613'}, 'load': {'idle': '20.044932', 'io': '13.094699', 'setup': '0.000012', 'task': '18.798995'}, 'save': {'idle': '410.683959', 'io': '0.901726', 'setup': '0.000057', 'task': '0.918671'}, 'total_time': '196.063520'})}], 'histogram_gpu': [{'frames': 200158, 'results': (212.759045273, {'eval': {'decode': '210.554455', 'evaluate': '40.633012', 'idle': '413.620578', 'init': '0.002574', 'memcpy': '0.236299', 'op_marshal': '0.448800', 'setup': '1.933014', 'task': '41.780361'}, 'load': {'idle': '413.341515', 'io': '9.167670', 'setup': '0.000025', 'task': '11.540432'}, 'save': {'idle': '440.917125', 'io': '2.527965', 'setup': '0.000013', 'task': '2.531425'}, 'total_time': '212.759045'})}], 'range_hist_gpu': [{'frames': 13930, 'results': (15.470490955, {'eval': {'decode': '15.007252', 'evaluate': '2.807952', 'idle': '57.974887', 'init': '0.000545', 'memcpy': '0.022520', 'op_marshal': '0.036840', 'setup': '0.218463', 'task': '2.889426'}, 'load': {'idle': '36.611417', 'io': '0.829372', 'setup': '0.000014', 'task': '1.005539'}, 'save': {'idle': '49.128137', 'io': '0.237561', 'setup': '0.000033', 'task': '0.240587'}, 'total_time': '15.470491'})}], 'strided_hist_long_gpu': [{'frames': 667, 'results': (83.648365171, {'eval': {'decode': '76.987508', 'evaluate': '0.140616', 'idle': '202.001004', 'init': '0.040956', 'memcpy': '0.004904', 'op_marshal': '0.006026', 'setup': '1.569928', 'task': '0.149030'}, 'load': {'idle': '10.002044', 'io': '4.149257', 'setup': '0.000027', 'task': '4.976019'}, 'save': {'idle': '93.588812', 'io': '0.025750', 'setup': '0.000072', 'task': '0.026424'}, 'total_time': '83.648365'})}], 'strided_hist_short_gpu': [{'frames': 6671, 'results': (212.162948942, {'eval': {'decode': '204.844343', 'evaluate': '1.292920', 'idle': '457.042288', 'init': '0.000492', 'memcpy': '0.012949', 'op_marshal': '0.023855', 'setup': '3.018403', 'task': '1.342122'}, 'load': {'idle': '20.008024', 'io': '10.930864', 'setup': '0.000015', 'task': '13.221638'}, 'save': {'idle': '380.174834', 'io': '0.144958', 'setup': '0.000033', 'task': '0.145794'}, 'total_time': '212.162949'})}]}
     standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
                           for k, v in scanner_results.iteritems()}
-    standalone_results['histogram_cpu'][0]['results'] = (1516.348484848, {})
-    standalone_results['histogram_gpu'][0]['results'] = (209.809224319, {})
-    standalone_results['flow_cpu'][0]['results'] = (716.195372751, {})
-    standalone_results['flow_gpu'][0]['results'] = (162.672109, {})
-    standalone_results['caffe'][0]['results'] = (1016.330196875, {})
+    # standalone_results['histogram_cpu'][0]['results'] = (1516.348484848, {})
+    # standalone_results['histogram_gpu'][0]['results'] = (209.809224319, {})
+    # standalone_results['flow_cpu'][0]['results'] = (716.195372751, {})
+    # standalone_results['flow_gpu'][0]['results'] = (162.672109, {})
+    # standalone_results['caffe'][0]['results'] = (1016.330196875, {})
     peak_results = copy.deepcopy(scanner_results)
     peak_results['histogram_cpu'][0]['results'] = (202.770002059 , {})
     peak_results['histogram_gpu'][0]['results'] = (209.73 , {})
@@ -1847,22 +1885,26 @@ def single_node_comparison_benchmark():
 
 
 def striding_comparison_benchmark():
+    # oliver: 157, 0.55
+    # kcam: 29, 0.0
+    # small: 23.1, 0.05
+    # large: 74.29, 0.33
     videos = [
-        ('oliver', '/n/scanner/apoms/videos/oliver_trump_720p.mp4',
-         52176),
-        ('kcam', '/n/scanner/wcrichto.new/videos/kcam/20150308_205310_836.mp4',
-         52542),
-        ('small', '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4',
-         139301),
+         #('oliver', '/n/scanner/apoms/videos/oliver_trump_720p.mp4',
+         # 52176),
+        #('kcam', '/n/scanner/wcrichto.new/videos/kcam/20150308_205310_836.mp4',
+          # 52542),
+        #('small', '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4',
+        # 139301),
         ('large', '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4',
-         200158),
+          200158),
     ]
 
     strides = [1, 5, 15] + range(30, 391, 60)
     tests = [{'name': '{:d}'.format(stride),
               'sampling': ('strided', stride),
               'scanner_settings': {
-                  'item_size': 128,
+                  'item_size': 10000,
                   'gpu_pool': '4G',
                   'pipeline_instances_per_node': 1
               }}
@@ -1876,84 +1918,79 @@ def striding_comparison_benchmark():
     graph.striding_comparison_graphs(strides, results)
 
 
+def multi_gpu_comparison_benchmark():
+    small_video = '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'
+    small_video_frames = 139301
+    large_video = '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'
+    large_video_frames = 200158
+
+    videos = [
+        ('small', small_video, small_video_frames),
+        ('large', large_video, large_video_frames),
+    ]
+
+    # base_tests = [
+    #     {'name': 'flow_gpu',
+    #      'sampling': ('all',),
+    #      'scanner_settings': {
+    #          'item_size': 1024,
+    #          'gpu_pool': '3G',
+    #      }},
+    #     {'name': 'histogram_gpu',
+    #      'sampling': ('all',),
+    #      'scanner_settings': {
+    #          'item_size': 2048,
+    #          'gpu_pool': '6G',
+    #      }},
+    #     {'name': 'caffe',
+    #      'sampling': ('all',),
+    #      'scanner_settings': {
+    #          'item_size': 2048,
+    #          'gpu_pool': '4G',
+    #      }}
+    # ]
+
+
+    base_tests = [
+        {'name': 'flow_gpu',
+         'sampling': ('range', [[0, 10000]]),
+         'scanner_settings': {
+             'item_size': 1024,
+             'gpu_pool': '3G',
+         }},
+        {'name': 'histogram_gpu',
+         'sampling': ('range', [[0, 100000]]),
+         'scanner_settings': {
+             'item_size': 2048,
+             'gpu_pool': '6G',
+         }},
+        {'name': 'caffe',
+         'sampling': ('range', [[0, 100000]]),
+         'scanner_settings': {
+             'item_size': 2048,
+             'gpu_pool': '5G',
+         }}
+    ]
+
+    gpus = [1, 2, 4]
+    tests = []
+    for g in gpus:
+        for t in base_tests:
+            b = copy.deepcopy(t)
+            b['name'] += "_{:d}".format(g)
+            b['scanner_settings']['pipeline_instances_per_node'] = 1
+            b['scanner_settings']['nodes'] = ['localhost:500{:d}'.format(i + 2)
+                                              for i in range(g)]
+            tests.append(b)
+
+    for name, video, frames in videos:
+         r = scanner_benchmark(video, frames, tests)
+         pprint(name)
+         pprint(r)
+         graph.multi_gpu_comparison_graphs(name, gpus, r)
+
+
 def micro_comparison_driver():
-    #pose_reconstruction_graphs({})
-    tests = {
-        'kcam': ['/n/scanner/wcrichto.new/videos/kcam/20150308_205310_836.mp4'],
-        #'fight': ['/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'],
-        #'excalibur': ['/n/scanner/wrichto.new/videos/movies/excalibur.mp4'],
-        #'mean': ['/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'],
-    }
-    frame_counts = {'charade': 163430,
-                    'fight': 200158,
-                    'excalibur': 202275,
-                    'mean': 139301,
-                    'kcam': 52542,
-    }
-    frame_wh = {'charade': {'width': 1920, 'height': 1080},
-                'fight': {'width': 1920, 'height': 800},
-                'excalibur': {'width': 1920, 'height': 1080},
-                'mean': {'width': 640, 'height': 480},
-                'kcam': {'width': 1280, 'height': 720},
-    }
-    t = 'fight'
-    if 0:
-        standalone_caffe_compute(tests)
-        peak_caffe_compute(tests, frame_counts, frame_wh)
-    #t = 'mean'
-    t = 'fight'
-    #standalone_results = standalone_benchmark(tests, frame_counts, frame_wh)
-    scanner_results = scanner_benchmark(tests, frame_counts, frame_wh)
-    #peak_results = peak_benchmark(tests, frame_counts, frame_wh)
-    print('what')
-    exit(1)
-    #peak_results = peak_benchmark(tests, frame_counts, frame_wh)
-    #scanner_results = scanner_benchmark(tests, frame_wh)
-    #peak_results = peak_benchmark(tests, frame_counts, frame_wh)
-    if 1:
-        #standalone_results = standalone_benchmark(tests, frame_counts, frame_wh)
-        scanner_results = scanner_benchmark(tests, frame_counts, frame_wh)
-        peak_results = peak_benchmark(tests, frame_counts, frame_wh)
-        print(scanner_results)
-        print(peak_results)
-        #comparison_graphs(t, frame_counts, frame_wh, standalone_results,
-        #                  scanner_results, peak_results)
-    if 0:
-        #640
-        t = 'mean'
-        standalone_results = {'mean': {'caffe': [(128.86, {'load': 34.5, 'save': 0.19, 'transform': 56.25, 'eval': 94.17, 'net': 37.91, 'total': 128.86})], 'flow': [(42.53, {'load': 0.13, 'total': 42.53, 'setup': 0.21, 'save': 5.44, 'eval': 17.58})], 'histogram': [(13.54, {'load': 7.05, 'total': 13.54, 'setup': 0.12, 'save': 0.05, 'eval': 6.32})]}}
-        scanner_results = {'mean': {'caffe': [(44.495288089, {'load': {'setup': '0.000009', 'task': '2.174472', 'idle': '173.748807', 'io': '2.138090'}, 'save': {'setup': '0.000008', 'task': '1.072224', 'idle': '117.011795', 'io': '1.065889'}, 'eval': {'task': '84.702374', 'evaluate': '83.057708', 'setup': '4.623244', 'evaluator_marshal': '1.427507', 'decode': '42.458139', 'idle': '146.444473', 'caffe:net': '34.756799', 'caffe:transform_input': '5.282478', 'memcpy': '1.353623'}})], 'flow': [(34.700563742, {'load': {'setup': '0.000010', 'task': '0.654652', 'idle': '83.952595', 'io': '0.641715'}, 'save': {'setup': '0.000008', 'task': '6.257866', 'idle': '62.448266', 'io': '6.257244'}, 'eval': {'task': '20.600713', 'evaluate': '20.410105', 'setup': '2.016671', 'evaluator_marshal': '0.094336', 'decode': '1.044027', 'idle': '105.924678', 'memcpy': '0.089637', 'flowcalc': '17.262241'}})], 'histogram': [(15.449293653, {'load': {'setup': '0.000007', 'task': '2.212311', 'idle': '83.767484', 'io': '2.192515'}, 'save': {'setup': '0.000008', 'task': '0.659185', 'idle': '59.795770', 'io': '0.658409'}, 'eval': {'task': '20.127624', 'evaluate': '19.132718', 'setup': '2.043204', 'histogram': '4.870099', 'decode': '14.261789', 'idle': '97.814596', 'evaluator_marshal': '0.845618', 'memcpy': '0.827516'}})]}}
-        peak_results = {'mean': {'caffe': [(41.27, {'feed': 40.9, 'load': 0.0, 'total': 41.27, 'transform': 3.28, 'decode': 40.97, 'idle': 9.04, 'eval': 37.21, 'net': 33.92, 'save': 0.34})], 'flow': [(29.91, {'feed': 15.62, 'load': 0.0, 'total': 29.91, 'decode': 0.85, 'eval': 18.21, 'save': 7.74})], 'histogram': [(12.3, {'feed': 12.25, 'load': 0.0, 'total': 12.3, 'setup': 0.0, 'decode': 12.26, 'eval': 4.11, 'save': 0.05})]}}
-        comparison_graphs(t, frame_counts, frame_wh, standalone_results,
-                          scanner_results, peak_results)
-    if 1:
-        #1920
-        t = 'fight'
-        #standalone_results = {'fight': {'caffe': [(252.92, {'load': 159.73, 'save': 0.19, 'transform': 55.09, 'eval': 93.0, 'net': 37.9, 'total': 252.92})], 'flow': [(57.03, {'load': 0.19, 'total': 57.03, 'setup': 0.23, 'save': 0.0, 'eval': 56.66})], 'histogram': [(52.41, {'load': 38.72, 'total': 52.41, 'setup': 0.16, 'save': 0.09, 'eval': 13.43})]}}
-        #scanner_results = {'fight': {'caffe': [(134.643764659, {'load': {'setup': '0.000313', 'task': '2.732178', 'idle': '483.639105', 'io': '2.694216'}, 'save': {'setup': '0.000012', 'task': '0.998610', 'idle': '327.472855', 'io': '0.992970'}, 'eval': {'task': '227.921991', 'evaluate': '193.274604', 'setup': '6.592625', 'evaluator_marshal': '34.380673', 'decode': '99.733381', 'idle': '421.211272', 'caffe:net': '34.503387', 'caffe:transform_input': '58.372106', 'memcpy': '34.279553'}})], 'flow': [(68.246963461, {'load': {'setup': '0.000659', 'task': '0.232119', 'idle': '258.826515', 'io': '0.198524'}, 'save': {'setup': '0.000007', 'task': '0.003803', 'idle': '194.370179', 'io': '0.003245'}, 'eval': {'task': '72.947458', 'evaluate': '68.481038', 'setup': '2.086686', 'evaluator_marshal': '4.323619', 'decode': '4.343175', 'idle': '300.531346', 'memcpy': '4.314552', 'flowcalc': '61.589261'}})], 'histogram': [(61.569025441, {'load': {'setup': '0.000008', 'task': '2.827806', 'idle': '266.692132', 'io': '2.804325'}, 'save': {'setup': '0.000006', 'task': '0.615977', 'idle': '182.132882', 'io': '0.613140'}, 'eval': {'task': '68.860379', 'evaluate': '67.389445', 'setup': '2.053393', 'histogram': '7.404950', 'decode': '59.979797', 'idle': '293.526000', 'evaluator_marshal': '1.278468', 'memcpy': '1.234116'}})]}}
-        #peak_results = {'fight': {'caffe': [(117.62, {'feed': 117.3, 'load': 0.0, 'total': 117.62, 'transform': 63.25, 'decode': 117.36, 'idle': 23.6, 'eval': 97.88, 'net': 34.63, 'save': 0.48})], 'flow': [(63.29, {'feed': 53.95, 'load': 0.0, 'total': 63.29, 'decode': 3.37, 'eval': 63.06, 'save': 2.44})], 'histogram': [(52.09, {'feed': 52.06, 'load': 0.0, 'total': 52.09, 'setup': 0.0, 'decode': 52.07, 'eval': 6.43, 'save': 0.53})]}}
-        #standalone_results = {'fight': {'caffe': [(252.92, 50000, {})],
-                                        # 'flow_gpu': [(57.03, 2500, {})],
-                                        # 'flow_cpu': [(15.03, 250, {})],
-                                        # 'histogram_cpu': [(15.41, 50000, {})],
-                                        # 'histogram_gpu': [(52.41, 50000, {})]}}
-
-        standalone_results = {'fight': {'histogram_gpu': [{'frames': 200158, 'results': (209.73, {'load': 155.6, 'total': 209.73, 'setup': 0.16, 'save': 0.37, 'eval': 53.52})}], 'caffe': [{'frames': 200158, 'results': (1016.33, {'load': 642.65, 'save': 0.62, 'transform': 222.14, 'eval': 373.05, 'net': 150.9, 'total': 1016.33})}], 'flow_cpu': [{'frames': 10007, 'results': (517.63, {'load': 4.06, 'total': 517.63, 'setup': 0.12, 'save': 0.0, 'eval': 513.56})}], 'histogram_cpu': [{'frames': 200158, 'results': (1508.85, {'load': 578.55, 'total': 1508.85, 'setup': 0.12, 'save': 0.2, 'eval': 929.99})}], 'flow_gpu': [{'frames': 10007, 'results': (233.72, {'load': 0.77, 'total': 233.72, 'setup': 0.25, 'save': 0.0, 'eval': 232.81})}]}}
-
-        #scanner_results = {'fight': {'caffe': [(134.643764659, 50000, {})],
-                                     # 'flow_gpu': [(68.246963461, 2500, {})],
-                                     # 'flow_cpu': [(10.569025441, 250, {})],
-                                     # 'histogram_cpu': [(40.569025441, 50000, {})],
-                                     # 'histogram_gpu': [(52.569025441, 50000, {})]}}
-        #peak_results = {'fight': {'caffe': [(120.643764659, 50000, {})],
-                                  # 'flow_gpu': [(58.246963461, 2500, {})],
-                                  # 'flow_cpu': [(8.569025441, 250, {})],
-                                  # 'histogram_cpu': [(40.569025441, 50000, {})],
-                                  # 'histogram_gpu': [(50.569025441, 50000, {})]}}
-                           
-        comparison_graphs(t, frame_counts, frame_wh, standalone_results,
-                          scanner_results, peak_results)
-    exit(1)
 
     #decode_sol(tests, frame_counts)
     tests = {
@@ -1971,49 +2008,6 @@ def micro_comparison_driver():
         kernel_sol(tests)
 
 
-    tests = {
-        #'fight': ['/n/scanner/wcrichto.new/videos/movies/fightClub.mp4'],
-        # 'fight': [
-        #     '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'
-        #     #'/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'
-        # ],
-        #'excalibur': ['/n/scanner/wrichto.new/videos/movies/excalibur.mp4'],
-        'mean': [
-            '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4',
-            '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'
-        ],
-    }
-    frame_counts = {'charade': 163430,
-                    'fight': 200158 * 1,
-                    'excalibur': 202275,
-                    'mean': 139301 * 2
-    }
-
-    t = 'mean'
-    if 0:
-        results = multi_gpu_benchmark(tests, frame_counts, frame_wh)
-        multi_gpu_graphs(t, frame_counts, frame_wh, results)
-
-    if 1:
-        t = 'fight'
-        all_results = {'fight': {'caffe': [450.6003510117739,
-                                                                744.8901229071761,
-                                                                1214.9085580870278],
-                                            'flow': [35.26797046326607, 65.1234304140463, 111.91821397303859],
-                                            'histogram': [817.7005547708027,
-                                                                                   1676.5330527934939,
-                                                                                   3309.0863111932586]}}
-        multi_gpu_graphs(t, frame_counts, frame_wh, all_results)
-    if 1:
-        t = 'mean'
-        results = {'mean': {'caffe': [1100.922914437792, 2188.3067699888497, 4350.245467315307],
-                            'flow': [130.15578312203905, 239.4233822453851, 355.9739890240647],
-                            'histogram': [3353.6737094160358,
-                                          6694.3141921293845,
-                                          12225.677026449643]}}
-        multi_gpu_graphs(t, frame_counts, frame_wh, results)
-
-
 BENCHMARKS = {
     'multi_gpu': multi_gpu_benchmark,
     'standalone': standalone_benchmark,
@@ -2023,8 +2017,9 @@ BENCHMARKS = {
 
 
 def bench_main(args):
-    #single_node_comparison_benchmark()
-    striding_comparison_benchmark()
+    single_node_comparison_benchmark()
+    #striding_comparison_benchmark()
+    #multi_gpu_comparison_benchmark()
     exit()
     test = args.test
     out_dir = args.output_directory

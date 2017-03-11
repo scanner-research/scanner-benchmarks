@@ -54,11 +54,11 @@ enum OpType {
 };
 
 const int BATCH_SIZE = 96;      // Batch size for network
-const int FLOW_CPU_WORK_REDUCTION = 200;
-const int FLOW_WORK_REDUCTION = 20;
 const int BINS = 16;
 const std::string NET_PATH = "features/googlenet.toml";
 
+int FRAMES = 0;
+int STRIDE = 1;
 std::vector<std::string> PATHS;
 int GPUS_PER_NODE = 1;           // GPUs to use per node
 
@@ -118,7 +118,7 @@ void video_histogram_cpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
     video.open(path);
     bool done = false;
     int64_t frame = 0;
-    while (!done) {
+    while (frame < FRAMES) {
       auto load_start = scanner::now();
       bool valid_frame = video.read(image);
       load_time += scanner::nano_since(load_start);
@@ -127,6 +127,11 @@ void video_histogram_cpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
       }
       if (image.data == nullptr) {
         break;
+      }
+      // Stride
+      if (STRIDE > 1) {
+        video.set(CV_CAP_PROP_POS_FRAMES, frame + STRIDE - 1);
+        frame += STRIDE - 1;
       }
       auto histo_start = scanner::now();
 
@@ -151,6 +156,7 @@ void video_histogram_cpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
     }
     outfile.close();
     printf("frame count %d\n", frame);
+    assert(frame >= FRAMES);
     TIMINGS["total"] = scanner::nano_since(start_time);
   }
   TIMINGS["setup"] = setup_time;
@@ -200,13 +206,14 @@ void video_histogram_gpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
                           std::fstream::binary | std::fstream::trunc);
     assert(outfile.good());
     cvc::GpuMat image(height, width, CV_8UC3);
+    cvc::GpuMat dummy_image(height, width, CV_8UC3);
     setup_time += scanner::nano_since(setup_start);
 
     auto start_time = scanner::now();
     video = cv::cudacodec::createVideoReader(path);
     bool done = false;
     int64_t frame = 0;
-    while (!done) {
+    while (frame < FRAMES) {
       auto load_start = scanner::now();
       bool valid_frame = video->nextFrame(image);
       load_time += scanner::nano_since(load_start);
@@ -215,6 +222,11 @@ void video_histogram_gpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
       }
       if (image.data == nullptr) {
         break;
+      }
+      // Stride
+      for (int i = 0; i < STRIDE - 1 && valid_frame; ++i) {
+        valid_frame = video->nextFrame(dummy_image);
+        frame++;
       }
       auto histo_start = scanner::now();
       cvc::split(image, planes);
@@ -265,7 +277,7 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
     int height = (int64_t)video.get(CV_CAP_PROP_FRAME_HEIGHT);
     assert(width != 0 && height != 0);
 
-    num_frames /= FLOW_CPU_WORK_REDUCTION;
+    num_frames = FRAMES;
 
     // Flow intermediates
     std::vector<cv::Mat> inputs;
@@ -363,7 +375,7 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
     int height = video->format().height;
     assert(width != 0 && height != 0);
 
-    num_frames /= FLOW_WORK_REDUCTION;
+    num_frames = FRAMES;
 
     // Flow intermediates
     std::vector<cvc::GpuMat> inputs;
@@ -582,6 +594,12 @@ int main(int argc, char** argv) {
         "operation", po::value<std::string>()->required(),
         "histogram, flow, or caffe")(
 
+        "frames", po::value<int>()->required(),
+        "Total number of frames")(
+
+        "stride", po::value<int>()->required(),
+        "Stride")(
+
         "gpus_per_node", po::value<int>(), "GPUs to use per node");
     try {
       po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -597,6 +615,10 @@ int main(int argc, char** argv) {
       paths_file = vm["paths_file"].as<std::string>();
 
       operation = vm["operation"].as<std::string>();
+
+      FRAMES = vm["frames"].as<int>();
+
+      STRIDE = vm["stride"].as<int>();
     } catch (const po::required_option& e) {
       if (vm.count("help")) {
         std::cout << desc << std::endl;

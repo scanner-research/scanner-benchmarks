@@ -49,6 +49,26 @@ set(LIBRARIES
   ${GFLAGS_LIBRARIES}
   ${GLOG_LIBRARIES})
 
+set(HALIDE_TARGETS)
+macro(add_halide_target SRC TARGET)
+  if (NOT HALIDE_FOUND)
+    find_package(Halide REQUIRED)
+    include(${CMAKE_SOURCE_DIR}/cmake/Util/HalideGenerator.cmake)
+    include_directories("${HALIDE_INCLUDE_DIR}")
+    include_directories("${PROJECT_BINARY_DIR}/generator_genfiles")
+  endif()
+
+  get_filename_component(NAME ${SRC} NAME_WE)
+  set(GENERATOR ${NAME}.generator)
+  halide_add_generator(${GENERATOR}
+    SRCS ${SRC})
+  halide_add_aot_library(${NAME}
+    GENERATOR_TARGET ${GENERATOR}
+    GENERATOR_ARGS target=${TARGET})
+  list(APPEND HALIDE_TARGETS ${NAME})
+  set(HALIDE_TARGETS ${HALIDE_TARGETS} PARENT_SCOPE)
+endmacro()
+
 add_subdirectory(util)
 add_subdirectory(standalone)
 #add_subdirectory(peak)

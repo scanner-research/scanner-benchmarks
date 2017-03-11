@@ -433,10 +433,14 @@ def comparison_graphs(name,
     #           'DNN']
     ops = ['histogram_cpu', 'histogram_gpu',
            'flow_cpu', 'flow_gpu',
-           'caffe']
+           'caffe',
+           'gather_hist_cpu',
+           'gather_hist_gpu']
     labels = ['HISTCPU', 'HISTGPU',
               'FLOWCPU', 'FLOWGPU',
-              'DNN']
+              'DNN',
+              'GATHERCPU',
+              'GATHERGPU']
 
     #for test_name, tests in results.iteritems():
     if 1:
@@ -489,14 +493,13 @@ def comparison_graphs(name,
 
         ys.append(standalone_y)
         ys.append(scanner_y)
-        ys.append(peak_y)
         print(ys)
 
         x = np.arange(len(ops)) * 1.3
 
-        variants = ['Baseline', 'Scanner', 'HandOpt']
+        variants = ['Baseline', 'Scanner']
 
-        colors = [NAIVE_COLOR, SCANNER_COLOR, PEAK_COLOR]
+        colors = [NAIVE_COLOR, SCANNER_COLOR]
         for (i, y) in enumerate(ys):
             xx = x+(i*0.35)
             ax.bar(xx, y, 0.3, align='center', color=colors[i],
@@ -506,12 +509,12 @@ def comparison_graphs(name,
                     ax.annotate("{}".format(labels[k]),
                                 xy=(xxx, -0.08), annotation_clip=False,
                                 ha='center')
-            if i == 2:
+            if i == 1:
                 for k, xy in enumerate(zip(xx, y)):
                     xp, yp = xy
                     yp += 0.05
                     #xp += 0.1
-                    ax.annotate("{:d}".format(int(peak_fps[k])), xy=(xp, yp),
+                    ax.annotate("{:d}".format(int(scanner_fps[k])), xy=(xp, yp),
                                 ha='center')
         if False:
             plt.legend(['Non-expert', 'Scanner', 'Hand-authored'],
@@ -571,7 +574,7 @@ def striding_comparison_graphs(strides, results, labels_on=True):
         plt.ylabel("Speedup (over no striding)")
     ax.xaxis.grid(False)
 
-    colors = [NAIVE_COLOR, SCANNER_COLOR, SCANNER2_COLOR]
+    colors = [NAIVE_COLOR, SCANNER_COLOR, SCANNER2_COLOR, PEAK_COLOR]
     #for test_name, tests in results.iteritems():
     labels = [name for name, _ in results]
     x = strides
@@ -603,6 +606,94 @@ def striding_comparison_graphs(strides, results, labels_on=True):
     fig.savefig('{:s}.pdf'.format(name), dpi=300)
 
     plt.clf()
+
+
+def multi_gpu_comparison_graphs(name, gpus, results,
+                                labels_on=True):
+    scale = 2.5
+    w = 3.33 * scale
+    h = 1.25 * scale
+    fig = plt.figure(figsize=(w, h))
+    if False:
+        fig.suptitle("Multigpu on {width}x{height} video".format(
+            width=width,
+            height=height))
+    ax = fig.add_subplot(111)
+    if labels_on:
+        plt.ylabel("Throughput (Relative to 1 GPU)")
+    ax.xaxis.grid(False)
+
+    ops = ['histogram_gpu', 'caffe', 'flow_gpu']
+    labels = ['HIST', 'DNN', 'FLOW']
+    num_gpus = gpus
+
+    x = np.arange(len(labels)) * 1.2
+    ys = [[0 for _ in range(len(num_gpus))] for _ in range(len(labels))]
+
+    for j, op in enumerate(ops):
+        print(op)
+        for i, g in enumerate(num_gpus):
+            f = results[op + '_{:d}'.format(g)][0]['frames']
+            t = results[op + '_{:d}'.format(g)][0]['results'][0]
+            ys[j][i] = float(f) / t
+
+    for i in range(len(num_gpus)):
+        xx = x + (i*0.35)
+        fps = [ys[l][i] for l, _ in enumerate(labels)]
+        y = [ys[l][i] / ys[l][0] for l, _ in enumerate(labels)]
+        ax.bar(xx, y, 0.3, align='center', color=SCANNER_COLOR,
+                    edgecolor='none')
+        for (j, xy) in enumerate(zip(xx, y)):
+            if i == 2:
+                xyx = xy[0]
+                xyy = xy[1] + 0.1
+                if labels_on:
+                    ax.annotate('{:d}'.format(int(fps[j])),
+                                xy=(xyx, xyy), ha='center')
+            if labels_on:
+                ax.annotate("{:d}".format(num_gpus[i]), xy=(xy[0], -0.30),
+                            ha='center', annotation_clip=False)
+
+    yt = [0, 1, 2, 3, 4]
+    ax.set_yticks(yt)
+    ax.set_yticklabels(['{:d}'.format(d) for d in yt])
+    ax.set_ylim([0, 4.2])
+
+    ax.set_xticks(x+0.3)
+    ax.set_xticklabels(labels, ha='center')
+    fig.tight_layout()
+    #ax.xaxis.labelpad = 10
+    ax.tick_params(axis='x', which='major', pad=15)
+    sns.despine()
+
+    variants = ['1 GPU', '2 GPUs', '4 GPUs']
+
+    name = 'multigpu_' + name
+    fig.savefig(name + '.png', dpi=600)
+    fig.savefig(name + '.pdf', dpi=600, transparent=True)
+    with open(name + '_results.txt', 'w') as f:
+        f.write('Speedup\n')
+        f.write('{:10s}'.format(''))
+        for l in variants:
+            f.write('{:10s} |'.format(l))
+        f.write('\n')
+        for i, r in enumerate(ys):
+            f.write('{:10s}'.format(labels[i]))
+            for n in r:
+                f.write('{:10f} |'.format(n / r[0]))
+            f.write('\n')
+
+        f.write('\nFPS\n')
+        f.write('{:10s}'.format(''))
+        for l in variants:
+            f.write('{:10s} |'.format(l))
+        f.write('\n')
+        for i, r in enumerate(ys):
+            f.write('{:10s}'.format(labels[i]))
+            for n in r:
+                f.write('{:10f} |'.format(n))
+            f.write('\n')
+    fig.clf()
 
 
 def convert_time(d):
