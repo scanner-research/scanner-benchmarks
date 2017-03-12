@@ -1704,6 +1704,8 @@ def single_node_comparison_benchmark():
         'strided_long': ('strided', 500),
         'gather': ('gather', []),
         'range': ('range', make_video_interval(small_video_frames)),
+        'hist_cpu_all': ('range', [[0, small_video_frames / 4]]),
+        'caffe_all': ('range', [[0, small_video_frames / 4]]),
         'flow_cpu_all': ('range', [[0, small_video_frames / 100]]),
         'flow_gpu_all': ('range', [[0, small_video_frames / 20]]),
     }
@@ -1716,7 +1718,9 @@ def single_node_comparison_benchmark():
         'strided_long': ('strided', 500),
         'gather': ('gather', []),
         'range': ('range', make_video_interval(large_video_frames)),
-        'flow_cpu_all': ('range', [[0, large_video_frames / 40]]),
+        'hist_cpu_all': ('range', [[0, large_video_frames / 4]]),
+        'caffe_all': ('range', [[0, large_video_frames / 4]]),
+        'flow_cpu_all': ('range', [[0, large_video_frames / 100]]),
         'flow_gpu_all': ('range', [[0, large_video_frames / 20]]),
     }
 
@@ -1724,9 +1728,9 @@ def single_node_comparison_benchmark():
     {'name': 'flow_cpu',
      'sampling': 'flow_cpu_all',
      'scanner_settings': {
-         'item_size': 16,
+         'item_size': 64,
          'cpu_pool': None,
-         'pipeline_instances_per_node': 16
+         'pipeline_instances_per_node': 32
      }},
         {'name': 'flow_gpu',
          'sampling': 'flow_gpu_all',
@@ -1736,7 +1740,7 @@ def single_node_comparison_benchmark():
              'pipeline_instances_per_node': 1
          }},
         {'name': 'histogram_cpu',
-         'sampling': 'all',
+         'sampling': 'hist_cpu_all',
          'scanner_settings': {
              'item_size': 1024,
              'cpu_pool': '32G',
@@ -1750,7 +1754,7 @@ def single_node_comparison_benchmark():
              'pipeline_instances_per_node': 1
          }},
         {'name': 'caffe',
-         'sampling': 'all',
+         'sampling': 'caffe_all',
          'scanner_settings': {
              'item_size': 2048,
              'gpu_pool': '4G',
@@ -1822,9 +1826,9 @@ def single_node_comparison_benchmark():
     # {'name': 'flow_cpu',
     #  'sampling': 'flow_cpu_all',
     #  'scanner_settings': {
-    #      'item_size': 64,
+    #      'item_size': 256,
     #      'cpu_pool': None,
-    #      'pipeline_instances_per_node': 32
+    #      'pipeline_instances_per_node': 1
     #  }}]
 
     # tests = [
@@ -1864,22 +1868,23 @@ def single_node_comparison_benchmark():
         x['sampling'] = large_samplings[t['sampling']]
         ltests.append(x)
 
-    standalone_results = standalone_benchmark(large_video, large_video_frames, ltests)
-    scanner_results = scanner_benchmark(large_video, large_video_frames, ltests)
-    #scanner_results = {'caffe': [{'frames': 200158, 'results': (435.417009556, {'eval': {'caffe:net': '133.468485', 'caffe:transform_input': '258.728724', 'decode': '433.395844', 'evaluate': '394.458044', 'idle': '501.945076', 'init': '0.002706', 'memcpy': '0.159120', 'op_marshal': '0.287858', 'setup': '4.555529', 'task': '395.459679'}, 'load': {'idle': '834.646811', 'io': '8.888973', 'setup': '0.000014', 'task': '11.284089'}, 'save': {'idle': '881.816857', 'io': '4.391589', 'setup': '0.000058', 'task': '4.394543'}, 'total_time': '435.417010'})}], 'flow_cpu': [{'frames': 1393, 'results': (107.269, {'eval': {'decode': '219.133559', 'evaluate': '1168.302351', 'idle': '2285.970730', 'init': '2.922672', 'op_marshal': '0.000060', 'setup': '2.365424', 'task': '1168.390835'}, 'load': {'idle': '20.038022', 'io': '0.082666', 'setup': '0.000042', 'task': '0.416600'}, 'save': {'idle': '153.042148', 'io': '0.005722', 'setup': '0.000843', 'task': '0.006521'}, 'total_time': '66.602660'})}], 'flow_gpu': [{'frames': 6965, 'results': (165.517797157, {'eval': {'decode': '157.755461', 'evaluate': '165.083624', 'idle': '194.313481', 'init': '0.000615', 'memcpy': '0.023921', 'op_marshal': '0.028010', 'setup': '1.788916', 'task': '165.177909'}, 'load': {'idle': '139.745307', 'io': '0.381288', 'setup': '0.000031', 'task': '0.487492'}, 'save': {'idle': '330.516962', 'io': '0.330057', 'setup': '0.000017', 'task': '0.330412'}, 'total_time': '165.517797'})}], 'histogram_cpu': [{'frames': 200158, 'results': (196.063520178, {'eval': {'decode': '2974.510456', 'evaluate': '2903.479715', 'idle': '3650.775328', 'init': '1.855995', 'op_marshal': '0.003225', 'setup': '9.740384', 'task': '2906.387613'}, 'load': {'idle': '20.044932', 'io': '13.094699', 'setup': '0.000012', 'task': '18.798995'}, 'save': {'idle': '410.683959', 'io': '0.901726', 'setup': '0.000057', 'task': '0.918671'}, 'total_time': '196.063520'})}], 'histogram_gpu': [{'frames': 200158, 'results': (212.759045273, {'eval': {'decode': '210.554455', 'evaluate': '40.633012', 'idle': '413.620578', 'init': '0.002574', 'memcpy': '0.236299', 'op_marshal': '0.448800', 'setup': '1.933014', 'task': '41.780361'}, 'load': {'idle': '413.341515', 'io': '9.167670', 'setup': '0.000025', 'task': '11.540432'}, 'save': {'idle': '440.917125', 'io': '2.527965', 'setup': '0.000013', 'task': '2.531425'}, 'total_time': '212.759045'})}], 'range_hist_gpu': [{'frames': 13930, 'results': (15.470490955, {'eval': {'decode': '15.007252', 'evaluate': '2.807952', 'idle': '57.974887', 'init': '0.000545', 'memcpy': '0.022520', 'op_marshal': '0.036840', 'setup': '0.218463', 'task': '2.889426'}, 'load': {'idle': '36.611417', 'io': '0.829372', 'setup': '0.000014', 'task': '1.005539'}, 'save': {'idle': '49.128137', 'io': '0.237561', 'setup': '0.000033', 'task': '0.240587'}, 'total_time': '15.470491'})}], 'strided_hist_long_gpu': [{'frames': 667, 'results': (83.648365171, {'eval': {'decode': '76.987508', 'evaluate': '0.140616', 'idle': '202.001004', 'init': '0.040956', 'memcpy': '0.004904', 'op_marshal': '0.006026', 'setup': '1.569928', 'task': '0.149030'}, 'load': {'idle': '10.002044', 'io': '4.149257', 'setup': '0.000027', 'task': '4.976019'}, 'save': {'idle': '93.588812', 'io': '0.025750', 'setup': '0.000072', 'task': '0.026424'}, 'total_time': '83.648365'})}], 'strided_hist_short_gpu': [{'frames': 6671, 'results': (212.162948942, {'eval': {'decode': '204.844343', 'evaluate': '1.292920', 'idle': '457.042288', 'init': '0.000492', 'memcpy': '0.012949', 'op_marshal': '0.023855', 'setup': '3.018403', 'task': '1.342122'}, 'load': {'idle': '20.008024', 'io': '10.930864', 'setup': '0.000015', 'task': '13.221638'}, 'save': {'idle': '380.174834', 'io': '0.144958', 'setup': '0.000033', 'task': '0.145794'}, 'total_time': '212.162949'})}]}
-    standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
-                          for k, v in scanner_results.iteritems()}
+    #standalone_results = standalone_benchmark(large_video, large_video_frames, ltests)
+    standalone_results = {'histogram_gpu': [{'frames': 200158, 'results': (208.96, {'load': 154.65, 'total': 208.96, 'setup': 0.15, 'save': 0.37, 'eval': 53.59})}], 'gather_hist_gpu': [{'frames': 400, 'results': (209.62, {'load': 0.33, 'total': 209.62, 'setup': 0.15, 'save': 0.0, 'eval': 0.12})}], 'flow_cpu': [{'frames': 333, 'results': (140.32, {'load': 1.41, 'total': 140.32, 'setup': 0.13, 'save': 0.0, 'eval': 138.91})}], 'histogram_cpu': [{'frames': 50039, 'results': (367.73, {'load': 145.82, 'total': 367.73, 'setup': 0.13, 'save': 0.05, 'eval': 221.79})}], 'flow_gpu': [{'frames': 10007, 'results': (232.46, {'load': 0.77, 'total': 232.46, 'setup': 0.28, 'save': 0.0, 'eval': 231.51})}], 'gather_hist_cpu': [{'frames': 400, 'results': (51.35, {'load': 2.37, 'total': 51.35, 'setup': 0.13, 'save': 0.0, 'eval': 3.73})}], 'caffe': [{'frames': 200158, 'results': (-1, {})}]}
+    scanner_results = {'caffe': [{'frames': 50039, 'results': (126.863404986, {'eval': {'caffe:net': '33.357140', 'caffe:transform_input': '66.319959', 'decode': '125.769289', 'evaluate': '100.174348', 'frames_decoded': 51320, 'frames_fed': 51643, 'frames_used': 50039, 'idle': '176.178832', 'init': '0.000490', 'memcpy': '0.020457', 'op_marshal': '0.030317', 'setup': '7.520566', 'task': '100.236231'}, 'load': {'idle': '229.027299', 'io': '2.452382', 'io_read': 507321797, 'setup': '0.001674', 'task': '3.056205'}, 'save': {'idle': '270.053932', 'io': '0.913868', 'io_write': 200556312, 'setup': '0.000248', 'task': '0.914203'}, 'total_time': '126.863405'})}], 'flow_cpu': [{'frames': 2001, 'results': (63.839779358, {'eval': {'decode': '205.726926', 'evaluate': '1768.963717', 'frames_decoded': 4085, 'frames_fed': 3685, 'frames_used': 2001, 'idle': '3163.768038', 'init': '0.681177', 'op_marshal': '0.000039', 'setup': '3.821897', 'task': '1769.154424'}, 'load': {'idle': '20.040472', 'io': '0.133431', 'io_read': 57562914, 'setup': '0.000163', 'task': '0.563751'}, 'save': {'idle': '147.624472', 'io': '0.006925', 'io_write': 18009, 'setup': '0.000857', 'task': '0.007475'}, 'total_time': '63.839779'})}], 'flow_gpu': [{'frames': 10007, 'results': (248.626166466, {'eval': {'decode': '238.256139', 'evaluate': '248.121545', 'frames_decoded': 10342, 'frames_fed': 10482, 'frames_used': 10007, 'idle': '275.726441', 'init': '0.002060', 'memcpy': '0.009847', 'op_marshal': '0.012221', 'setup': '3.580473', 'task': '248.186052'}, 'load': {'idle': '296.323660', 'io': '0.539573', 'io_read': 112728829, 'setup': '0.000282', 'task': '0.678909'}, 'save': {'idle': '496.894921', 'io': '0.569726', 'io_write': 90063, 'setup': '0.000303', 'task': '0.569924'}, 'total_time': '248.626166'})}], 'gather_hist_cpu': [{'frames': 400, 'results': (21.549662711, {'eval': {'decode': '165.283746', 'evaluate': '3.290798', 'frames_decoded': 37481, 'frames_fed': 40082, 'frames_used': 401, 'idle': '573.573771', 'init': '0.043311', 'op_marshal': '0.000037', 'setup': '1.580372', 'task': '3.292639'}, 'load': {'idle': '20.008724', 'io': '2.915937', 'io_read': 412212668, 'setup': '0.000196', 'task': '3.555391'}, 'save': {'idle': '62.876299', 'io': '0.018731', 'io_write': 80200, 'setup': '0.000054', 'task': '0.020275'}, 'total_time': '21.549663'})}], 'gather_hist_gpu': [{'frames': 400, 'results': (50.547078065, {'eval': {'decode': '46.507375', 'evaluate': '0.098743', 'frames_decoded': 42586, 'frames_fed': 45454, 'frames_used': 401, 'idle': '132.330747', 'init': '0.000372', 'memcpy': '0.005163', 'op_marshal': '0.005359', 'setup': '2.500418', 'task': '0.104367'}, 'load': {'idle': '10.003470', 'io': '2.651054', 'io_read': 412212668, 'setup': '0.000407', 'task': '3.141374'}, 'save': {'idle': '60.482490', 'io': '0.015511', 'io_write': 80200, 'setup': '0.000209', 'task': '0.015551'}, 'total_time': '50.547078'})}], 'histogram_cpu': [{'frames': 50039, 'results': (51.12213506, {'eval': {'decode': '708.187778', 'evaluate': '698.622058', 'frames_decoded': 52611, 'frames_fed': 52814, 'frames_used': 50039, 'idle': '1315.758985', 'init': '0.255978', 'op_marshal': '0.000204', 'setup': '2.810293', 'task': '698.773590'}, 'load': {'idle': '20.046779', 'io': '3.222126', 'io_read': 533254426, 'setup': '0.000052', 'task': '5.084221'}, 'save': {'idle': '119.417376', 'io': '0.067553', 'io_write': 10007800, 'setup': '0.000030', 'task': '0.068376'}, 'total_time': '51.122135'})}], 'histogram_gpu': [{'frames': 200158, 'results': (215.634761139, {'eval': {'decode': '213.731645', 'evaluate': '39.514628', 'frames_decoded': 205543, 'frames_fed': 206534, 'frames_used': 200158, 'idle': '418.698448', 'init': '0.000948', 'memcpy': '0.086007', 'op_marshal': '0.135303', 'setup': '4.463794', 'task': '39.757738'}, 'load': {'idle': '418.835705', 'io': '9.484100', 'io_read': 1972359963, 'setup': '0.000232', 'task': '11.587169'}, 'save': {'idle': '446.926429', 'io': '2.214957', 'io_write': 40031600, 'setup': '0.000180', 'task': '2.216198'}, 'total_time': '215.634761'})}]}
+    #scanner_results = scanner_benchmark(large_video, large_video_frames, ltests)
+    # standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
+    #                       for k, v in scanner_results.iteritems()}
     # standalone_results['histogram_cpu'][0]['results'] = (1516.348484848, {})
     # standalone_results['histogram_gpu'][0]['results'] = (209.809224319, {})
     # standalone_results['flow_cpu'][0]['results'] = (716.195372751, {})
     # standalone_results['flow_gpu'][0]['results'] = (162.672109, {})
-    # standalone_results['caffe'][0]['results'] = (1016.330196875, {})
+    standalone_results['caffe'][0]['results'] = (1021.214285714, {})
     peak_results = copy.deepcopy(scanner_results)
-    peak_results['histogram_cpu'][0]['results'] = (202.770002059 , {})
+    peak_results['histogram_cpu'][0]['results'] = (50.692014531, {})
     peak_results['histogram_gpu'][0]['results'] = (209.73 , {})
-    peak_results['flow_cpu'][0]['results'] = (53.517230781, {})
-    peak_results['flow_gpu'][0]['results'] = (162.672109524, {})
-    peak_results['caffe'][0]['results'] = (467.658878505, {})
+    # peak_results['flow_cpu'][0]['results'] = (53.517230781, {})
+    peak_results['flow_gpu'][0]['results'] = (233.742059043, {})
+    peak_results['caffe'][0]['results'] = (116.913551402, {})
     graph.comparison_graphs('large', 1920, 800, standalone_results, scanner_results,
                             peak_results)
 

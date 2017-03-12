@@ -55,7 +55,7 @@ enum OpType {
 
 const int BATCH_SIZE = 96;      // Batch size for network
 const int BINS = 16;
-const std::string NET_PATH = "features/googlenet.toml";
+const std::string NET_PATH = "nets/googlenet.toml";
 
 int FRAMES = 0;
 int STRIDE = 1;
@@ -523,12 +523,12 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
       for (b = 0; b < BATCH_SIZE; b++) {
         auto load_start = scanner::now();
         bool valid_frame = video.read(input);
-        assert(input.data != nullptr);
         load_time += scanner::nano_since(load_start);
         if (!valid_frame) {
           done = true;
           break;
         }
+        assert(input.data != nullptr);
         auto transform_start = scanner::now();
         cv::resize(input, images[b],
                    cv::Size(net_input_width, net_input_height), 0, 0,

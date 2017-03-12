@@ -495,7 +495,7 @@ def comparison_graphs(name,
         ys.append(scanner_y)
         print(ys)
 
-        x = np.arange(len(ops)) * 1.3
+        x = np.arange(len(ops)) * 1.4
 
         variants = ['Baseline', 'Scanner']
 
