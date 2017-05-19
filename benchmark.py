@@ -17,7 +17,7 @@ from timeit import default_timer as now
 import string
 import random
 import glob
-from scannerpy import Database, DeviceType, ScannerException
+from scannerpy import Database, DeviceType, ScannerException, Job
 from scannerpy.stdlib import NetDescriptor
 from scannerpy.config import Config
 import numpy as np
@@ -234,6 +234,67 @@ def get_trial_total_io_read(result):
             counters = prof['counters']
             total_io += counters['io_read'] if 'io_read' in counters else 0
     return total_io
+
+
+def video_encoding_benchmark_2():
+    input_video = '/bigdata/wcrichto/videos/movies/excalibur.mp4'
+    output_video = '/tmp/out.mp4'
+
+    with Database() as db:
+        def decode(t, image = False, device = DeviceType.CPU):
+            frame = db.table(t).as_op().all()
+            if image:
+                if device == DeviceType.CPU:
+                    image_type = db.protobufs.ImageDecoderArgs.ANY
+                else:
+                    image_type = db.protobufs.ImageDecoderArgs.JPEG
+                frame = db.ops.ImageDecoder(img = frame, image_type = image_type)
+            dummy = db.ops.DiscardFrame(
+                ignore = frame, device = device if not image else DeviceType.CPU)
+            job = Job(columns = [dummy], name = 'example_dummy')
+            start = now()
+            out = db.run(job, force = True, work_item_size = 1000, pipeline_instances_per_node = 1)
+            # out.profiler().write_trace('{}.trace'.format(t.name()))
+            return now() - start
+
+        print('Ingesting baseline')
+        db.ingest_videos([('baseline', input_video)], force=True)
+        _, f = next(db.table('baseline').load(['frame'], rows=[0]))
+        [input_height, input_width, _] = f[0].shape
+
+        for scale in [1, 2, 4, 8]:
+            width = (input_width / scale) // 2 * 2
+            height = (input_height / scale) // 2 * 2
+
+            print('Resizing baseline')
+            frame = db.table('baseline').as_op().range(0, 1000, item_size = 100)
+            resized = db.ops.Resize(
+                frame = frame, width = width, height = height,
+                device = DeviceType.CPU)
+            job = Job(columns = [resized.compress_video()], name = 'test')
+            out = db.run(job, force = True, work_item_size=10)
+            out.profiler().write_trace('resized.trace')
+            exit()
+
+            print('Dumping frames')
+            frame = db.table('test').as_op().all()
+            img = db.ops.ImageEncoder(frame = frame)
+            job = Job(columns = [img], name = 'test_img')
+            db.run(job, force = True)
+
+            t = decode('test')
+            print('Video (CPU)', t)
+
+            t = decode('test', device = DeviceType.GPU)
+            print('Video (GPU)', t)
+
+            t = decode('test_img')
+            print('Image (CPU)', t)
+
+            t = decode('test_img', device = DeviceType.GPU)
+            print('Image (GPU)', t)
+
+            exit()
 
 
 def video_encoding_benchmark():
@@ -2022,7 +2083,8 @@ BENCHMARKS = {
 
 
 def bench_main(args):
-    single_node_comparison_benchmark()
+    video_encoding_benchmark_2()
+    # single_node_comparison_benchmark()
     #striding_comparison_benchmark()
     #multi_gpu_comparison_benchmark()
     exit()
