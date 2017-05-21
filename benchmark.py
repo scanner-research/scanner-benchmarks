@@ -2056,6 +2056,87 @@ def multi_gpu_comparison_benchmark():
          graph.multi_gpu_comparison_graphs(name, gpus, r)
 
 
+def surround360_single_node_benchmark():
+    cmd_args = (
+        '--flow_alg pixflow_search_20 ' +
+        '--rig_json_file ~/temp/geometric_calibration/camera_rig.json ' +
+        '--quality 8k ' +
+        '--start_frame 0 ' +
+        '--end_frame {num_frames:d} ' +
+        '--surround360_render_dir {surround360_dir:s} ' +
+        '--cores {cores:d} ' +
+        '--root_dir ~/datasets/surround360/palace3')
+        #'--root_dir /n/scanner/datasets/surround360/palace3')
+    num_frames = 150
+    #num_frames = 2
+    surround360_dir = '/h/apoms/repos/Surround360/surround360_render'
+
+    base_cmd = os.path.join(surround360_dir,
+                            'scripts/batch_process_video.py')
+    scanner_cmd = os.path.join(surround360_dir,
+                               'scripts/scanner_process_video.py')
+    cmd_template = 'taskset -c {cpu_list:s} python {cmd:s} {args:s}'
+
+    cpus = [2**i for i in range(1, 7)]
+    #cpus = [2**i for i in range(5, 6)]
+    base_tests = []
+    scanner_tests = []
+    for c in cpus:
+        # Base test
+        cpu_list = ','.join([str(d) for d in range(c)])
+        cmd = cmd_template.format(
+            cpu_list=cpu_list,
+            cmd=base_cmd,
+            args=cmd_args.format(num_frames=num_frames - 1,
+                                 surround360_dir=surround360_dir,
+                                 cores=c))
+        print('Running surrround360 base, {:d} cores'.format(c))
+        clear_filesystem_cache()
+        current_env = os.environ.copy()
+        start = time.time()
+        print(cmd)
+        p = subprocess.Popen(
+            cmd, env=current_env, stdout=DEVNULL, stderr=subprocess.STDOUT,
+            shell=True)
+        pid, rc, ru = os.wait4(p.pid, 0)
+        elapsed = time.time() - start
+        if rc != 0:
+            print('Surround360 base FAILED after {:.3f}s'.format(elapsed))
+            elapsed = -1
+        else:
+            print('Surround360 base succeeded, took {:.3f}s'.format(elapsed))
+        base_tests.append(elapsed)
+
+        # Scanner test
+        cmd = cmd_template.format(
+            cpu_list=cpu_list,
+            cmd=scanner_cmd,
+            args=cmd_args.format(num_frames=num_frames - 1,
+                                 surround360_dir=surround360_dir,
+                                 cores=c))
+        print('Running surrround360 scanner, {:d} cores'.format(c))
+        clear_filesystem_cache()
+        start = now()
+        elapsed = now() - start
+        current_env = os.environ.copy()
+        start = time.time()
+        print(cmd)
+        p = subprocess.Popen(
+            cmd, env=current_env, stdout=DEVNULL, stderr=subprocess.STDOUT,
+            shell=True)
+        pid, rc, ru = os.wait4(p.pid, 0)
+        elapsed = time.time() - start
+        if rc != 0:
+            print('Surround360 scanner FAILED after {:.3f}s'.format(elapsed))
+            elapsed = -1
+        else:
+            print('Surround360 scanner succeeded, took {:.3f}s'.format(elapsed))
+        scanner_tests.append(elapsed)
+
+    graph.surround360_single_node_graph(num_frames, cpus,
+                                        base_tests, scanner_tests)
+
+
 def micro_comparison_driver():
 
     #decode_sol(tests, frame_counts)
@@ -2083,7 +2164,8 @@ BENCHMARKS = {
 
 
 def bench_main(args):
-    video_encoding_benchmark_2()
+    surround360_single_node_benchmark()
+    #video_encoding_benchmark_2()
     # single_node_comparison_benchmark()
     #striding_comparison_benchmark()
     #multi_gpu_comparison_benchmark()

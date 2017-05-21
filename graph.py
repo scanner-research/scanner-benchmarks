@@ -695,6 +695,78 @@ def multi_gpu_comparison_graphs(name, gpus, results,
             f.write('\n')
     fig.clf()
 
+def surround360_single_node_graph(num_frames, cpus, base_results, scanner_results,
+                                labels_on=True):
+    scale = 2.5
+    w = 3.33 * scale
+    h = 1.25 * scale
+    fig = plt.figure(figsize=(w, h))
+    if False:
+        fig.suptitle("Surround360 single node scaling on {:d} frames".format(
+            num_frames))
+    ax = fig.add_subplot(111)
+    if labels_on:
+        plt.ylabel("Throughput (Relative to Base 2 CPUs)")
+    ax.xaxis.grid(False)
+
+    labels = ['BASE', 'SCANNER']
+    num_cpus = cpus
+
+    x = num_cpus
+    ys = [[0 for _ in range(len(num_cpus))] for _ in range(len(labels))]
+
+    base_throughput = num_frames / base_results[0]
+    for j, op in enumerate([base_results, scanner_results]):
+        for i, g in enumerate(num_cpus):
+            ys[j][i] = num_frames / op[i]
+
+    colors = [SPARK_COLOR, SCANNER_COLOR]
+    for i, (method, color) in enumerate(zip(labels, colors)):
+        y = [v / base_throughput for v in ys[i]]
+        ax.plot(x, y, color=color)
+
+    #yt = [0, 1, 2, 3, 4]
+    #ax.set_yticks(yt)
+    #ax.set_yticklabels(['{:d}'.format(d) for d in yt])
+    #ax.set_ylim([0, 4.2])
+
+    ax.set_xticks(num_cpus)
+    #ax.set_xticklabels(labels, ha='center')
+    fig.tight_layout()
+    #ax.xaxis.labelpad = 10
+    ax.tick_params(axis='x', which='major', pad=15)
+    sns.despine()
+
+
+    name = 'surround360_single_node'
+    fig.savefig(name + '.png', dpi=600)
+    fig.savefig(name + '.pdf', dpi=600, transparent=True)
+
+    variants = ['{:d} CPUs' for c in num_cpus]
+    with open(name + '_results.txt', 'w') as f:
+        f.write('Speedup\n')
+        f.write('{:10s}'.format(''))
+        for l in variants:
+            f.write('{:10s} |'.format(l))
+        f.write('\n')
+        for i, r in enumerate(ys):
+            f.write('{:10s}'.format(labels[i]))
+            for n in r:
+                f.write('{:10f} |'.format(n / base_throughput))
+            f.write('\n')
+
+        f.write('\nFPS\n')
+        f.write('{:10s}'.format(''))
+        for l in variants:
+            f.write('{:10s} |'.format(l))
+        f.write('\n')
+        for i, r in enumerate(ys):
+            f.write('{:10s}'.format(labels[i]))
+            for n in r:
+                f.write('{:10f} |'.format(n))
+            f.write('\n')
+    fig.clf()
+
 
 def convert_time(d):
     def convert(t):
