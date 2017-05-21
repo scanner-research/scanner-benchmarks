@@ -242,7 +242,7 @@ def video_encoding_benchmark_2():
 
     with Database() as db:
         def decode(t, image = False, device = DeviceType.CPU):
-            frame = db.table(t).as_op().all()
+            frame = db.table(t).as_op().all(item_size = 1000)
             if image:
                 if device == DeviceType.CPU:
                     image_type = db.protobufs.ImageDecoderArgs.ANY
@@ -253,12 +253,12 @@ def video_encoding_benchmark_2():
                 ignore = frame, device = device if not image else DeviceType.CPU)
             job = Job(columns = [dummy], name = 'example_dummy')
             start = now()
-            out = db.run(job, force = True, work_item_size = 1000, pipeline_instances_per_node = 1)
+            out = db.run(job, force = True, work_item_size = 100)
             # out.profiler().write_trace('{}.trace'.format(t.name()))
             return now() - start
 
-        print('Ingesting baseline')
-        db.ingest_videos([('baseline', input_video)], force=True)
+        # print('Ingesting baseline')
+        # db.ingest_videos([('baseline', input_video)], force=True)
         _, f = next(db.table('baseline').load(['frame'], rows=[0]))
         [input_height, input_width, _] = f[0].shape
 
@@ -266,33 +266,36 @@ def video_encoding_benchmark_2():
             width = (input_width / scale) // 2 * 2
             height = (input_height / scale) // 2 * 2
 
-            print('Resizing baseline')
-            frame = db.table('baseline').as_op().range(0, 1000, item_size = 100)
-            resized = db.ops.Resize(
-                frame = frame, width = width, height = height,
-                device = DeviceType.CPU)
-            job = Job(columns = [resized.compress_video()], name = 'test')
-            out = db.run(job, force = True, work_item_size=10)
-            out.profiler().write_trace('resized.trace')
-            exit()
+            # print('Resizing baseline')
+            # frame = db.table('baseline').as_op().range(0, 30000)
+            # resized = db.ops.Resize(
+            #     frame = frame, width = width, height = height,
+            #     device = DeviceType.GPU)
+            # job = Job(columns = [resized], name = 'test')
+            # t = now()
+            # out = db.run(job, force = True, work_item_size=10)
+            # print('{:.3f}'.format(now() - t))
+            # #out.profiler().write_trace('resized.trace')
 
-            print('Dumping frames')
-            frame = db.table('test').as_op().all()
-            img = db.ops.ImageEncoder(frame = frame)
-            job = Job(columns = [img], name = 'test_img')
-            db.run(job, force = True)
+            # print('Dumping frames')
+            # frame = db.table('baseline').as_op().range(0, 30000)
+            # img = db.ops.ImageEncoder(frame = frame)
+            # job = Job(columns = [img], name = 'test_img')
+            # t = now()
+            # db.run(job, force = True, work_item_size=10)
+            # print('{:.3f}'.format(now() - t))
 
             t = decode('test')
             print('Video (CPU)', t)
 
-            t = decode('test', device = DeviceType.GPU)
-            print('Video (GPU)', t)
+            # t = decode('test', device = DeviceType.GPU)
+            # print('Video (GPU)', t)
 
-            t = decode('test_img')
-            print('Image (CPU)', t)
+            # t = decode('test_img', image = True)
+            # print('Image (CPU)', t)
 
-            t = decode('test_img', device = DeviceType.GPU)
-            print('Image (GPU)', t)
+            # t = decode('test_img', image = True, device = DeviceType.GPU)
+            # print('Image (GPU)', t)
 
             exit()
 
