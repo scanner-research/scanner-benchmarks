@@ -236,69 +236,108 @@ def get_trial_total_io_read(result):
     return total_io
 
 
+# TODO: re-encode video from stride
 def video_encoding_benchmark_2():
-    input_video = '/bigdata/wcrichto/videos/movies/excalibur.mp4'
-    output_video = '/tmp/out.mp4'
+    input_videos = [
+        '/n/scanner/datasets/movies/private/excalibur_1981.mp4',
+        '/n/scanner/datasets/movies/private/toy_story_3_2010.mp4',
+        '/n/scanner/datasets/movies/private/interstellar_2014.mp4']
 
     with Database() as db:
-        def decode(t, image = False, device = DeviceType.CPU):
-            frame = db.table(t).as_op().all(item_size = 1000)
-            if image:
-                if device == DeviceType.CPU:
-                    image_type = db.protobufs.ImageDecoderArgs.ANY
-                else:
-                    image_type = db.protobufs.ImageDecoderArgs.JPEG
-                frame = db.ops.ImageDecoder(img = frame, image_type = image_type)
-            dummy = db.ops.DiscardFrame(
-                ignore = frame, device = device if not image else DeviceType.CPU)
-            job = Job(columns = [dummy], name = 'example_dummy')
-            start = now()
-            out = db.run(job, force = True, work_item_size = 100)
-            # out.profiler().write_trace('{}.trace'.format(t.name()))
-            return now() - start
+        def decode(ts, fn, image = False, device = DeviceType.CPU, profile = None, num_jobs = 1):
+            jobs = []
+            for t in ts:
+                t = db.table(t)
+                frame = fn(t.as_op())
+                if image:
+                    frame = db.ops.ImageDecoder(
+                        img = frame,
+                        image_type = db.protobufs.ImageDecoderArgs.JPEG)
+                dummy = db.ops.DiscardFrame(ignore = frame, device = device)
+                job = Job(columns = [dummy], name = 'ignore_{}'.format(t.name()))
+                jobs.append(job)
 
-        # print('Ingesting baseline')
-        # db.ingest_videos([('baseline', input_video)], force=True)
-        _, f = next(db.table('baseline').load(['frame'], rows=[0]))
+            clear_filesystem_cache()
+            start = now()
+            out = db.run(jobs, force = True, work_item_size = 10,
+                             show_progress = True)
+                             #pipeline_instances_per_node = 1)
+            t = now() - start
+            if profile is not None:
+                out[0].profiler().write_trace('{}.trace'.format(profile))
+            return t
+
+        for input_video in input_videos:
+            if not db.has_table(input_video):
+                print('Ingesting baseline {}'.format(input_video))
+                db.ingest_videos([(input_video, input_video)], force=True)
+
+        _, f = next(db.table(input_videos[0]).load(['frame'], rows=[0]))
         [input_height, input_width, _] = f[0].shape
 
-        for scale in [1, 2, 4, 8]:
+        times = {
+            'vid_cpu': {},
+            'vid_gpu': {},
+            'img_cpu': {},
+            'img_gpu': {}
+        }
+
+        for scale in [2, 4, 8]:
             width = (input_width / scale) // 2 * 2
             height = (input_height / scale) // 2 * 2
 
-            # print('Resizing baseline')
-            # frame = db.table('baseline').as_op().range(0, 30000)
-            # resized = db.ops.Resize(
-            #     frame = frame, width = width, height = height,
-            #     device = DeviceType.GPU)
-            # job = Job(columns = [resized], name = 'test')
-            # t = now()
-            # out = db.run(job, force = True, work_item_size=10)
-            # print('{:.3f}'.format(now() - t))
-            # #out.profiler().write_trace('resized.trace')
+            vid_names = ['{}_{}'.format(input_video, scale) for input_video in input_videos]
+            img_names = ['{}_{}_img'.format(input_video, scale) for input_video in input_videos]
 
-            # print('Dumping frames')
-            # frame = db.table('baseline').as_op().range(0, 30000)
-            # img = db.ops.ImageEncoder(frame = frame)
-            # job = Job(columns = [img], name = 'test_img')
-            # t = now()
-            # db.run(job, force = True, work_item_size=10)
-            # print('{:.3f}'.format(now() - t))
+            for (input_video, vid_name) in zip(input_videos, vid_names):
+                if not db.has_table(vid_name):
+                    print('Resizing baseline to {}'.format(vid_name))
+                    frame = db.table(input_video).as_op().all()
+                    resized = db.ops.Resize(
+                        frame = frame, width = width, height = height,
+                        device = DeviceType.CPU)
+                    job = Job(columns = [resized], name = vid_name)
+                    t = now()
+                    out = db.run(job, force = True, work_item_size=1)
+                    print('{:.3f}'.format(now() - t))
+                    #out.profiler().write_trace('resized.trace')
 
-            t = decode('test')
-            print('Video (CPU)', t)
+            for (img_name, vid_name) in zip(img_names, vid_names):
+                if not db.has_table(img_name):
+                    print('Dumping frames to {}'.format(img_name))
+                    frame = db.table(vid_name).as_op().all()
+                    img = db.ops.ImageEncoder(frame = frame)
+                    job = Job(columns = [img], name = img_name)
+                    t = now()
+                    db.run(job, force = True, work_item_size=1)
+                    print('{:.3f}'.format(now() - t))
 
-            # t = decode('test', device = DeviceType.GPU)
-            # print('Video (GPU)', t)
+            for k in times:
+                times[k][scale] = {}
 
-            # t = decode('test_img', image = True)
-            # print('Image (CPU)', t)
+            for stride in [1]:
+                if stride == 1:
+                    fn = lambda item: lambda t: t.all(item_size=item)
+                else:
+                    fn = lambda item: lambda t: t.strided(stride, item_size=item)
 
-            # t = decode('test_img', image = True, device = DeviceType.GPU)
-            # print('Image (GPU)', t)
+                # t = decode(vid_names, fn(1000), profile='vid_cpu_{}'.format(scale))
 
-            exit()
+                # times['vid_cpu'][scale][stride] = t
 
+                t = decode(vid_names, fn(1000), device = DeviceType.GPU, profile='vid_gpu_{}'.format(scale))
+
+                times['vid_gpu'][scale][stride] = t
+
+                # t = decode(img_names, fn(10), image = True)
+                #                #profile = 'img_cpu_{}'.format(stride))
+                # #
+                # times['img_cpu'][scale][stride] = t
+
+                # t = decode(img_names, fn(10), image = True, device = DeviceType.GPU)
+                # times['img_gpu'][scale][stride] = t
+
+                pprint(times)
 
 def video_encoding_benchmark():
     input_video = '/bigdata/wcrichto/videos/charade_short.mkv'
@@ -2167,8 +2206,8 @@ BENCHMARKS = {
 
 
 def bench_main(args):
-    surround360_single_node_benchmark()
-    #video_encoding_benchmark_2()
+    # surround360_single_node_benchmark()
+    video_encoding_benchmark_2()
     # single_node_comparison_benchmark()
     #striding_comparison_benchmark()
     #multi_gpu_comparison_benchmark()
