@@ -33,11 +33,10 @@ add_definitions(-DHAVE_CUDA)
 
 include_directories(
   "."
-  ${BOOST_INCLUDE_DIRS}
+  ${Boost_INCLUDE_DIRS}
   ${CUDA_INCLUDE_DIRS}
   ${CAFFE_INCLUDE_DIRS}
-  ${OPENCV_INCLUDE_DIRS}
-  ${OPENCV_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
   ${TINYTOML_INCLUDE_DIR})
 
 set(LIBRARIES

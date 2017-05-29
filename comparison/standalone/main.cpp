@@ -47,13 +47,7 @@ using namespace scanner;
 
 using WorkerFn= std::function<void(int, Queue<int64_t>&)>;
 
-enum OpType {
-  Histogram,
-  Flow,
-  Caffe
-};
-
-const int BATCH_SIZE = 96;      // Batch size for network
+const int BATCH_SIZE = 128;      // Batch size for network
 const int BINS = 16;
 const std::string NET_PATH = "nets/googlenet.toml";
 
@@ -70,6 +64,110 @@ std::string meta_path(std::string path) {
 
 std::string output_path(int64_t idx) {
   return "/tmp/standalone_outputs/videos" + std::to_string(idx) + ".bin";
+}
+
+void video_decode_cpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
+  double setup_time = 0;
+  double load_time = 0;
+
+  cv::VideoCapture video;
+  while (true) {
+    int64_t work_item_index;
+    work_items.pop(work_item_index);
+
+    if (work_item_index == -1) {
+      break;
+    }
+
+    const std::string& path = PATHS[work_item_index];
+
+    auto setup_start = scanner::now();
+    video.open(path);
+    int width = (int64_t)video.get(CV_CAP_PROP_FRAME_WIDTH);
+    int height = (int64_t)video.get(CV_CAP_PROP_FRAME_HEIGHT);
+    assert(width != 0 && height != 0);
+    setup_time += scanner::nano_since(setup_start);
+
+    auto start_time = scanner::now();
+    video.open(path);
+    bool done = false;
+    int64_t frame = 0;
+    cv::Mat image(height, width, CV_8UC3);
+    while (frame < FRAMES) {
+      auto load_start = scanner::now();
+      bool valid_frame = video.read(image);
+      load_time += scanner::nano_since(load_start);
+      if (!valid_frame) {
+        done = true;
+      }
+      if (image.data == nullptr) {
+        break;
+      }
+      // Stride
+      if (STRIDE > 1) {
+        video.set(CV_CAP_PROP_POS_FRAMES, frame + STRIDE - 1);
+        frame += STRIDE - 1;
+      }
+      frame++;
+    }
+    printf("frame count %d\n", frame);
+    assert(frame >= FRAMES);
+    TIMINGS["total"] += scanner::nano_since(start_time);
+  }
+  TIMINGS["setup"] = setup_time;
+  TIMINGS["load"] = load_time;
+}
+
+void video_decode_gpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
+  double setup_time = 0;
+  double load_time = 0;
+
+  cv::cuda::setDevice(gpu_device_id);
+  cv::Ptr<cv::cudacodec::VideoReader> video;
+  while (true) {
+    int64_t work_item_index;
+    work_items.pop(work_item_index);
+
+    if (work_item_index == -1) {
+      break;
+    }
+
+    const std::string& path = PATHS[work_item_index];
+
+    auto setup_start = scanner::now();
+    video = cv::cudacodec::createVideoReader(path);
+    int width = video->format().width;
+    int height = video->format().height;
+    assert(width != 0 && height != 0);
+    setup_time += scanner::nano_since(setup_start);
+
+    auto start_time = scanner::now();
+    video = cv::cudacodec::createVideoReader(path);
+    bool done = false;
+    int64_t frame = 0;
+    cvc::GpuMat image(height, width, CV_8UC3);
+    while (frame < FRAMES) {
+      auto load_start = scanner::now();
+      bool valid_frame = video->nextFrame(image);
+      load_time += scanner::nano_since(load_start);
+      if (!valid_frame) {
+        done = true;
+      }
+      if (image.data == nullptr) {
+        break;
+      }
+      // Stride
+      for (int i = 0; i < STRIDE - 1 && valid_frame; ++i) {
+        valid_frame = video->nextFrame(image);
+        frame++;
+      }
+    }
+    printf("frame count %d\n", frame);
+    assert(frame >= FRAMES);
+    TIMINGS["total"] += scanner::nano_since(start_time);
+  }
+  TIMINGS["setup"] = setup_time;
+  TIMINGS["load"] = load_time;
 }
 
 void video_histogram_cpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
@@ -577,7 +675,6 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
 }
 
 int main(int argc, char** argv) {
-  std::string input_type;
   std::string paths_file;
   std::string operation;
   std::string gpus_per_node;
@@ -585,14 +682,11 @@ int main(int argc, char** argv) {
     po::variables_map vm;
     po::options_description desc("Allowed options");
     desc.add_options()("help", "Produce help message")(
-        "input_type", po::value<std::string>()->required(),
-        "bmp, jpg, or mp4")(
-
         "paths_file", po::value<std::string>()->required(),
         "File which contains paths to videos or folders of images")(
 
         "operation", po::value<std::string>()->required(),
-        "histogram, flow, or caffe")(
+        "decode, histogram, flow, or caffe")(
 
         "frames", po::value<int>()->required(),
         "Total number of frames")(
@@ -610,8 +704,6 @@ int main(int argc, char** argv) {
         return 1;
       }
 
-      input_type = vm["input_type"].as<std::string>();
-
       paths_file = vm["paths_file"].as<std::string>();
 
       operation = vm["operation"].as<std::string>();
@@ -628,11 +720,15 @@ int main(int argc, char** argv) {
       }
     }
   }
-  std::cout << "input " << input_type << ", paths " << paths_file
+  std::cout << "paths " << paths_file
             << ", operation " << operation << std::endl;
 
   WorkerFn worker_fn;
-  if (operation == "histogram_cpu") {
+  if (operation == "decode_cpu") {
+    worker_fn = video_decode_cpu_worker;
+  } else if (operation == "decode_gpu") {
+    worker_fn = video_decode_gpu_worker;
+  } else if (operation == "histogram_cpu") {
     worker_fn = video_histogram_cpu_worker;
   } else if (operation == "histogram_gpu") {
     worker_fn = video_histogram_gpu_worker;

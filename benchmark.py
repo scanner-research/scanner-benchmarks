@@ -30,33 +30,26 @@ SCANNER_DIR = os.path.join(SCRIPT_DIR, '..', 'scanner')
 COMPARISON_DIR = os.path.join(SCRIPT_DIR, 'comparison')
 DEVNULL = open(os.devnull, 'wb', 0)
 
+DB_PATH = '/tmp/scanner_db'
+
 
 def clear_filesystem_cache():
     os.system('sudo sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"')
 
 
-def make_db(opts):
+def make_db(opts={}):
     config_path = opts['config_path'] if 'config_path' in opts else None
-    db_path = opts['db_path'] if 'db_path' in opts else None
-    config = Config(config_path)
-    if db_path is not None:
-        config.db_path = db_path
-    return Database(master='localhost:5001', workers=['localhost:5003'], config=config)
+    db_path = opts['db_path'] if 'db_path' in opts else DB_PATH
+    config = Config(config_path, db_path=db_path)
+    #return Database(master='localhost:5001', workers=['localhost:5003'],
+    #                config=config)
+    return Database(debug=True,
+                    config=config)
 
 
-def run_trial(tasks, pipeline, collection_name, opts={}):
-    print('Running trial: collection {:s} ...:'.format(collection_name))
+def run_trial(db, jobs, opts={}):
+    print('Running trial...')
     # Clear cache
-    config_path = opts['config_path'] if 'config_path' in opts else None
-    db_path = opts['db_path'] if 'db_path' in opts else None
-    config = Config(config_path)
-    if db_path is not None:
-        config.db_path = db_path
-    workers = ['localhost']
-    if 'nodes' in opts:
-        workers = opts['nodes']
-    #db = Database(master='localhost:5001', workers=workers, config=config)
-    db = Database(master='localhost:5001', workers=['localhost:5003'], config=config)
     scanner_opts = {}
     def add_opt(s):
         if s in opts:
@@ -71,9 +64,8 @@ def run_trial(tasks, pipeline, collection_name, opts={}):
     prof = None
     try:
         clear_filesystem_cache()
-        out_collection = db.run(tasks, pipeline, collection_name, force=True,
-                                **scanner_opts)
-        prof = out_collection.profiler()
+        out_table = db.run(jobs, force=True, **scanner_opts)
+        prof = out_table.profiler()
         elapsed = now() - start
         total = prof.total_time_interval()
         t = (total[1] - total[0])
@@ -86,34 +78,7 @@ def run_trial(tasks, pipeline, collection_name, opts={}):
         prof = None
         print('Trial FAILED after {:.3f}s: {:s}'.format(elapsed, str(e)))
         t = -1
-    db.stop_cluster()
     return success, t, prof
-
-
-def run_opencv_trial(video_file, gpus_per_node, batch_size):
-    print('Running opencv trial: {:d} gpus, {:d} batch size'.format(
-        gpus_per_node,
-        batch_size
-    ))
-    clear_filesystem_cache()
-    current_env = os.environ.copy()
-    start = time.time()
-    program_path = os.path.join(
-        COMPARISON_DIR, 'build/opencv/opencv_compare')
-    p = subprocess.Popen([
-        program_path,
-        '--video_paths_file', video_file,
-        '--gpus_per_node', str(gpus_per_node),
-        '--batch_size', str(batch_size)
-    ], env=current_env, stdout=DEVNULL, stderr=subprocess.STDOUT)
-    pid, rc, ru = os.wait4(p.pid, 0)
-    elapsed = time.time() - start
-    if rc != 0:
-        print('Trial FAILED after {:.3f}s'.format(elapsed))
-        elapsed = -1
-    else:
-        print('Trial succeeded, took {:.3f}s'.format(elapsed))
-    return elapsed
 
 
 def run_caffe_trial(net, net_descriptor_file, device_type, net_input_width,
@@ -444,85 +409,6 @@ def count_frames(video):
     return int(subprocess.check_output(cmd.format(video), shell=True))
 
 
-def multi_gpu_benchmark(tests, frame_counts, frame_wh):
-    db_path = '/tmp/scanner_multi_gpu_db'
-
-    db = scanner.Scanner()
-    scanner_settings = {
-        'db_path': db_path,
-        'node_count': 1,
-        'pus_per_node': 1,
-        'io_item_size': 256,
-        'work_item_size': 64,
-        'tasks_in_queue_per_pu': 3,
-        'force': True,
-        'env': {
-            'SC_JOB_NAME': 'base'
-        }
-    }
-    dataset_name = 'multi_gpu'
-    video_job = 'base'
-
-    #num_gpus = [1]
-    #num_gpus = [4]
-    num_gpus = [1, 2, 4]
-    #num_gpus = [2, 4]
-    operations = [('histogram', 'histogram_benchmark'),
-                  #('caffe', 'caffe_benchmark')]
-                  ('caffe', 'caffe_benchmark'),
-                  ('flow', 'flow_benchmark')]
-
-
-    all_results = {}
-    for test_name, paths in tests.iteritems():
-        all_results[test_name] = {}
-        for op, _ in operations:
-            all_results[test_name][op] = []
-
-        #frames = count_frames(video)
-        os.system('rm -rf {}'.format(db_path))
-        print('Ingesting {}'.format(paths))
-        # ingest data
-        db = make_db(scanner_settings)
-        result, _ = db.ingest('video', dataset_name, paths, scanner_settings)
-        if result is False:
-            print('Failed to ingest')
-            exit()
-
-        scanner_settings['env']['SC_JOB_NAME'] = video_job
-
-        for op, pipeline in operations:
-            for gpus in num_gpus:
-                frames = frame_counts[test_name]
-                if op == 'histogram':
-                    if frame_wh[test_name]['width'] == 640:
-                        scanner_settings['io_item_size'] = 2048
-                        scanner_settings['work_item_size'] = 1024
-                    else:
-                        scanner_settings['io_item_size'] = 512
-                        scanner_settings['work_item_size'] = 128
-                elif op == 'flow':
-                    frames /= 20
-                    scanner_settings['io_item_size'] = 512
-                    scanner_settings['work_item_size'] = 64
-                elif op == 'caffe':
-                    scanner_settings['io_item_size'] = 480
-                    scanner_settings['work_item_size'] = 96
-                elif op == 'caffe_cpm2':
-                    scanner_settings['io_item_size'] = 256
-                    scanner_settings['work_item_size'] = 64
-
-                scanner_settings['node_count'] = gpus
-                print('Running {}, {} GPUS'.format(op, gpus))
-                t, _ = run_trial(dataset_name, pipeline,
-                                 op, scanner_settings)
-                print(t, frames / float(t))
-                all_results[test_name][op].append(float(frames) / float(t))
-
-    pprint(all_results)
-    return all_results
-
-
 def run_cmd(template, settings):
     cmd = template.format(**settings)
     if os.system(cmd) != 0:
@@ -719,95 +605,6 @@ def multi_node_benchmark():
 """)
 
 
-
-def image_video_decode_benchmark():
-    input_video = '/bigdata/wcrichto/videos/charade_short.mkv'
-    num_frames = 2878 # TODO(wcrichto): automate this
-    output_video = '/tmp/test.mkv'
-    output_im_bmp = '/tmp/test_bmp'
-    output_im_jpg = '/tmp/test_jpg'
-    paths_file = '/tmp/paths.txt'
-    dataset_name = 'video_encoding'
-    in_job_name = scanner.Scanner.base_job_name()
-    input_width = 1920
-    input_height = 1080
-
-    scales = []
-
-    for scale in [1, 2, 3, 4, 8]:
-        width = input_width / scale
-        height = input_height / scale
-        # FFMPEG says dimensions must be multiple of 2
-        scales.append('{}x{}'.format(width//2 * 2, height//2 * 2))
-
-    scale_template = "ffmpeg -i {input} -vf scale={scale} -c:v libx264 {output}"
-    jpg_template = "ffmpeg -i {input} {output}/frame%07d.jpg"
-    bmp_template = "ffmpeg -i {input} {output}/frame%07d.bmp"
-
-    db = scanner.Scanner()
-    scanner_settings = {
-        'force': True,
-        'node_count': 1,
-        'work_item_size': 512
-    }
-
-    def run_cmd(template, settings):
-        cmd = template.format(**settings)
-        if os.system(cmd) != 0:
-            print('Bad command: {}'.format(cmd))
-            exit()
-
-    all_results = {}
-    for scale in scales:
-        all_results[scale] = {}
-
-        os.system('rm {}'.format(output_video))
-        run_cmd(scale_template, {
-            'input': input_video,
-            'output': output_video,
-            'scale': scale
-        })
-
-        os.system('mkdir -p {path} && rm -f {path}/*'.format(path=output_im_bmp))
-        run_cmd(bmp_template, {
-            'input': output_video,
-            'output': output_im_bmp
-        })
-
-        os.system('mkdir -p {path} && rm -f {path}/*'.format(path=output_im_jpg))
-        run_cmd(jpg_template, {
-            'input': output_video,
-            'output': output_im_jpg
-        })
-
-        datasets = [('video', [output_video], 'effective_decode_rate'),
-                    ('image', ['{}/{}'.format(output_im_bmp, f)
-                               for f in os.listdir(output_im_bmp)],
-                     'image_decode_rate'),
-                    ('image', ['{}/{}'.format(output_im_jpg, f)
-                               for f in os.listdir(output_im_jpg)],
-                     'image_decode_rate')]
-
-        for (i, (ty, paths, pipeline)) in enumerate(datasets):
-            result, _ = db.ingest(ty, dataset_name, paths, {'force': True})
-            if result != True:
-                print('Error: failed to ingest')
-                exit()
-
-            pus_per_node = cpu_count() if pipeline == 'image_decode_rate' else 1
-            scanner_settings['pus_per_node'] = pus_per_node
-            t, result = run_trial(dataset_name, in_job_name, pipeline,
-                                  'test', scanner_settings)
-            stats = generate_statistics(result)
-            all_results[scale][i] = {
-                'decode': stats['eval']['decode'],
-                'io': stats['load']['io'],
-                'total': t
-            }
-
-    pprint(all_results)
-
-
 def disk_size(path):
     output = subprocess.check_output("du -bh {}".format(path), shell=True)
     return output.split("\t")[0]
@@ -943,7 +740,8 @@ def storage_benchmark():
     print(json.dumps(all_sizes))
 
 
-def standalone_benchmark(video, video_frames, tests):
+def standalone_benchmark(video, tests):
+    video_frames = video['frames']
     output_dir = '/tmp/standalone'
     test_output_dir = '/tmp/standalone_outputs'
     paths_file = os.path.join(output_dir, 'paths.txt')
@@ -968,9 +766,8 @@ def standalone_benchmark(video, video_frames, tests):
             for p in paths[1:]:
                 f.write('\n' + p)
 
-    def run_standalone_trial(input_type, paths_file, operation, frames, stride):
-        print('Running standalone trial: {}, {}, {}'.format(
-            input_type,
+    def run_standalone_trial(paths_file, operation, frames, stride):
+        print('Running standalone trial: {}, {}'.format(
             paths_file,
             operation))
         clear_filesystem_cache()
@@ -980,7 +777,6 @@ def standalone_benchmark(video, video_frames, tests):
             COMPARISON_DIR, 'build/standalone/standalone_comparison')
         p = subprocess.Popen([
             program_path,
-            '--input_type', input_type,
             '--paths_file', paths_file,
             '--operation', operation,
             '--frames', str(frames),
@@ -1019,10 +815,12 @@ def standalone_benchmark(video, video_frames, tests):
     os.system('rm -rf {}'.format(output_dir))
     os.system('mkdir {}'.format(output_dir))
 
+    video_samplings = video['samplings']
+    path = video['path']
     run_paths = []
-    base = os.path.basename(video)
+    base = os.path.basename(path)
     run_path = os.path.join(output_dir, base)
-    os.system('cp {} {}'.format(video, run_path))
+    os.system('cp {} {}'.format(path, run_path))
     run_paths.append(run_path)
     write_paths(run_paths)
 
@@ -1037,7 +835,7 @@ def standalone_benchmark(video, video_frames, tests):
                 break
         assert(test_type is not None)
 
-        sampling = test['sampling']
+        sampling = video_samplings[test['sampling']]
         results[name] = []
 
         frames = video_frames
@@ -1055,8 +853,8 @@ def standalone_benchmark(video, video_frames, tests):
 
         os.system('rm -rf {}'.format(test_output_dir))
         os.system('mkdir -p {}'.format(test_output_dir))
-        total, timings = run_standalone_trial('mp4', paths_file, test_type,
-                                              frames, stride)
+        total, timings = run_standalone_trial(paths_file, test_type, frames,
+                                              stride)
         results[name].append({'results': (total, timings),
                               'frames': frames / stride})
 
@@ -1064,62 +862,61 @@ def standalone_benchmark(video, video_frames, tests):
     return results
 
 
-def scanner_benchmark(video, total_frames, tests):
-    db_dir = '/tmp/scanner_db'
-    default_scanner_settings = {
-        'db_path': db_dir,
-        'node_count': 1,
-        'work_item_size': 96,
-        'tasks_in_queue_per_pu': 3,
-        'force': True,
-        'env': {}
-    }
-    db = make_db(default_scanner_settings)
-    collection_name = 'test'
-
+def scanner_benchmark(video, tests):
     # Histogram benchmarks
-    hist_cpu = db.ops.Histogram(device=DeviceType.CPU)
-    hist_gpu = db.ops.Histogram(device=DeviceType.GPU)
+    def decode_pipeline(device):
+        def fn(frame):
+            return db.ops.DiscardFrame(ignore=frame, device=device)
+        return fn
+
+    decode_cpu = decode_pipeline(device=DeviceType.CPU)
+    decode_gpu = decode_pipeline(device=DeviceType.GPU)
+
+    def hist_pipeline(device):
+        def fn(frame):
+            return db.ops.Histogram(frame=frame, device=device)
+        return fn
+
+    hist_cpu = hist_pipeline(device=DeviceType.CPU)
+    hist_gpu = hist_pipeline(device=DeviceType.GPU)
 
     # Optical flow benchmarks
     def of_pipeline(dt):
-        table_input = db.ops.Input()
-        of = db.ops.OpticalFlow(
-            inputs=[(table_input, ["frame", "frame_info"])],
-            device=dt)
-        disc = db.ops.Discard(
-            inputs=[(of, ["flow"])],
-            device=dt)
-        return disc
+        def fn(frame):
+            flow = db.ops.OpticalFlow(frame=frame, device=dt)
+            return db.ops.DiscardFrame(ignore=flow, device=dt)
+        return fn
 
-    of_cpu = of_pipeline(DeviceType.CPU)
-    of_gpu = of_pipeline(DeviceType.GPU)
+    of_cpu = of_pipeline(dt=DeviceType.CPU)
+    of_gpu = of_pipeline(dt=DeviceType.GPU)
 
     # Caffe benchmark
-    descriptor = NetDescriptor.from_file(db, 'nets/googlenet.toml')
+    with make_db() as db:
+        descriptor = NetDescriptor.from_file(db, 'nets/googlenet.toml')
     caffe_args = db.protobufs.CaffeArgs()
     caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
-    caffe_args.batch_size = 96
+    caffe_args.batch_size = 128
 
-    def caffe_pipeline(device_type):
-        table_input = db.ops.Input()
-        caffe_input = db.ops.CaffeInput(
-            inputs=[(table_input, ["frame", "frame_info"])],
-            args=caffe_args,
-            device=device_type)
-        caffe = db.ops.Caffe(
-            inputs=[(caffe_input, ["caffe_frame"]),
-                    (table_input, ["frame_info"])],
-            args=caffe_args,
-            device=device_type)
-        return caffe
+    def caffe_pipeline(device):
+        def fn(frame):
+            caffe_input = db.ops.CaffeInput(
+                frame=frame,
+                args=caffe_args,
+                device=device)
+            return db.ops.Caffe(
+                caffe_frame=caffe_input,
+                args=caffe_args,
+                device=device)
+        return fn
 
-    caffe_cpu = caffe_pipeline(DeviceType.CPU)
-    caffe_gpu = caffe_pipeline(DeviceType.GPU)
+    caffe_cpu = caffe_pipeline(device=DeviceType.CPU)
+    caffe_gpu = caffe_pipeline(device=DeviceType.GPU)
 
     # Multi-view stereo benchmark
 
     operations = {
+        'decode_cpu': decode_cpu,
+        'decode_gpu': decode_gpu,
         'histogram_cpu': hist_cpu,
         'histogram_gpu': hist_gpu,
         'flow_cpu': of_cpu,
@@ -1135,19 +932,21 @@ def scanner_benchmark(video, total_frames, tests):
         'range_hist_gpu': hist_gpu,
     }
 
-    os.system('rm -rf {}'.format(db_dir))
+    os.system('rm -rf {}'.format(DB_PATH))
 
     # ingest data
-    db.stop_cluster()
-    db = make_db(default_scanner_settings)
-    collection, f = db.ingest_video_collection(collection_name, [video],
-                                               force=True)
-    db.stop_cluster()
-    assert(len(f) == 0)
+    video_samplings = video['samplings']
+    video_path = video['path']
+    total_frames = video['frames']
+    table_name = 'test_video'
+    with make_db() as db:
+        _, f = db.ingest_videos([(table_name, video_path)], force=True)
+        assert(len(f) == 0)
 
     results = {}
     for test in tests:
         name = test['name']
+        is_gpu = True if name[-3:] == 'gpu' else False
 
         ops = None
         for o, pipeline in operations.iteritems():
@@ -1157,47 +956,48 @@ def scanner_benchmark(video, total_frames, tests):
         assert(ops is not None)
 
         settings = test['scanner_settings']
-        sampling = test['sampling']
+        sampling = video_samplings[test['sampling']]
 
         results[name] = []
 
         # Parse sampling
-        item_size = settings['item_size']
-        sampling_type = sampling[0]
-        print(sampling)
-        if sampling_type == 'all':
-            sampled_input = db.sampler().all(collection, item_size=item_size)
-            frames = total_frames
-        elif sampling_type == 'strided':
-            sampled_input = db.sampler().strided(collection,
-                                                 sampling[1],
-                                                 item_size=item_size)
-            frames = total_frames / sampling[1]
-        elif sampling_type == 'gather':
-            sampled_input = [db.sampler().gather(collection,
-                                                 sampling[1],
-                                                 item_size=item_size)]
-            frames = len(sampling[1])
-        elif sampling_type == 'range':
-            sampled_input = db.sampler().ranges(collection,
-                                                sampling[1],
-                                                item_size=item_size)
-            frames = sum(e - s for s, e in sampling[1])
-        else:
-            print('Not a valid sampling type:', sampling_type)
-            exit(1)
-
+        task_size = settings['task_size']
         # Parse settings
-        opts = default_scanner_settings.copy()
-        opts.update(settings)
-        opts['work_item_size'] = 96
-        print('Running {:s}'.format(name))
-        #frame_factor = 50
-        success, total, prof = run_trial(sampled_input, ops, 'out', opts)
-        assert(success)
-        stats = prof.statistics()
-        prof.write_trace(name + '.trace')
-        results[name].append({'results': (total, stats), 'frames': frames})
+        opts = settings
+        opts['work_item_size'] = 256 if is_gpu else 64
+        with make_db() as db:
+            print('Running {:s}'.format(name))
+
+            sampling_type = sampling[0]
+            print(sampling)
+
+            table = db.table(table_name).as_op()
+            if sampling_type == 'all':
+                sampled_input = table.all(task_size=task_size)
+                frames = total_frames
+            elif sampling_type == 'strided':
+                sampled_input = tabl.strided(sampling[1],
+                                             task_size=task_size)
+                frames = total_frames / sampling[1]
+            elif sampling_type == 'gather':
+                sampled_input = table.gather(sampling[1],
+                                             task_size=task_size)
+                frames = len(sampling[1])
+            elif sampling_type == 'range':
+                sampled_input = table.ranges(sampling[1],
+                                             task_size=task_size)
+                frames = sum(e - s for s, e in sampling[1])
+            else:
+                print('Not a valid sampling type:', sampling_type)
+                exit(1)
+
+            frame = sampled_input
+            job = Job(columns=[ops(frame)], name='dummy_output')
+            success, total, prof = run_trial(db, job, opts)
+            assert(success)
+            stats = prof.statistics()
+            prof.write_trace(name + '.trace')
+            results[name].append({'results': (total, stats), 'frames': frames})
 
     print(video)
     pprint(results)
@@ -1362,26 +1162,26 @@ def scanner_striding_test(video, total_frames, tests):
         results[name] = []
 
         # Parse sampling
-        item_size = settings['item_size']
+        task_size = settings['task_size']
         sampling_type = sampling[0]
         print(sampling)
         if sampling_type == 'all':
-            sampled_input = db.sampler().all(collection, item_size=item_size)
+            sampled_input = db.sampler().all(collection, task_size=task_size)
             frames = total_frames
         elif sampling_type == 'strided':
             sampled_input = db.sampler().strided(collection,
                                                  sampling[1],
-                                                 item_size=item_size)
+                                                 task_size=task_size)
             frames = total_frames / sampling[1]
         elif sampling_type == 'gather':
             sampled_input = [db.sampler().gather(collection,
                                                  sampling[1],
-                                                 item_size=item_size)]
+                                                 task_size=task_size)]
             frames = len(sampling[1])
         elif sampling_type == 'range':
             sampled_input = db.sampler().ranges(collection,
                                                 sampling[1],
-                                                item_size=item_size)
+                                                task_size=task_size)
             frames = sum(e - s for s, e in sampling[1])
         else:
             print('Not a valid sampling type:', sampling_type)
@@ -1402,122 +1202,6 @@ def scanner_striding_test(video, total_frames, tests):
     print(video)
     pprint(results)
     return results
-
-
-def decode_sol(tests, frame_count):
-    db_dir = '/tmp/scanner_db'
-    input_video = '/tmp/scanner_db/datasets/test/data/0_data.bin'
-
-    db = scanner.Scanner()
-    db._db_path = db_dir
-    scanner_settings = {
-        'db_path': db_dir,
-        'node_count': 1,
-        'pus_per_node': 1,
-        'io_item_size': 8192,
-        'work_item_size': 4096,
-        'tasks_in_queue_per_pu': 4,
-        'force': True,
-        'env': {}
-    }
-    dataset_name = 'test'
-    video_job = 'base'
-
-    decode_pipeline = 'effective_decode_rate'
-
-    def run_ocv_trial(ty, path):
-        print('Running ocv trial: {}'.format(path))
-        clear_filesystem_cache()
-        current_env = os.environ.copy()
-        start = time.time()
-        program_path = os.path.join(
-            COMPARISON_DIR, 'build/ocv_decode/ocv_decode')
-        p = subprocess.Popen([
-            program_path,
-            '--decoder', ty,
-            '--path', path,
-        ], env=current_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        so, se = p.communicate()
-        rc = p.returncode
-        elapsed = time.time() - start
-        timings = {}
-        if rc != 0:
-            print('Trial FAILED after {:.3f}s'.format(elapsed))
-            print(so)
-            elapsed = -1
-        else:
-            print('Trial succeeded, took {:.3f}s'.format(elapsed))
-            for line in so.splitlines():
-                if line.startswith('TIMING: '):
-                    k, s, v = line[len('TIMING: '):].partition(",")
-                    timings[k] = float(v)
-            elapsed = timings['total']
-        return elapsed, timings
-
-    def run_cmd(template, settings):
-        cmd = template.format(**settings)
-        if os.system(cmd) != 0:
-            print('Bad command: {}'.format(cmd))
-            exit()
-
-    ffmpeg_cpu_template = 'ffmpeg -vcodec h264 -i {path} -f null -'
-    ffmpeg_gpu_template = 'ffmpeg -vcodec h264_cuvid -i {path} -f null -'
-
-
-    all_results = {}
-    for test_name, paths in tests.iteritems():
-        assert(len(paths) == 1)
-        path = paths[0]
-
-        all_results[test_name] = {}
-
-        vid_path = '/tmp/vid'
-
-        os.system('rm -rf {}'.format(db_dir))
-        os.system('cp {} {}'.format(path, vid_path))
-
-        # ingest data
-        result, _ = db.ingest('video', dataset_name, paths, scanner_settings)
-        assert(result)
-
-        if test_name == 'mean':
-            scanner_settings['io_item_size'] = 8192
-            scanner_settings['work_item_size'] = 2048
-        if test_name == 'fight':
-            scanner_settings['io_item_size'] = 2048
-            scanner_settings['work_item_size'] = 512
-
-
-        # Scanner decode
-        total, prof = run_trial(dataset_name, decode_pipeline, 'test',
-                                scanner_settings)
-        all_results[test_name]['scanner'] = total
-
-        # OCV decode
-        total, _ = run_ocv_trial('cpu', vid_path)
-        all_results[test_name]['opencv_cpu'] = total
-
-        total, _ = run_ocv_trial('gpu', vid_path)
-        all_results[test_name]['opencv_gpu'] = total
-
-        # FFMPEG CPU decode
-        start_time = time.time()
-        run_cmd(ffmpeg_cpu_template, {'path': vid_path})
-        all_results[test_name]['ffmpeg_cpu'] = time.time() - start_time
-
-        # FFMPEG GPU decode
-        start_time = time.time()
-        run_cmd(ffmpeg_gpu_template, {'path': vid_path})
-        all_results[test_name]['ffmpeg_gpu'] = time.time() - start_time
-
-        print('Decode test on ', test_name)
-        print("{:10s} | {:6s} | {:7s}".format('Type', 'Total', 'FPS'))
-        for ty, total in all_results[test_name].iteritems():
-            print("{:10s} | {:6.2f} | {:7.2f}".format(
-                ty, total, frame_count[test_name] / total))
-
-    print(all_results)
-    return all_results
 
 
 def kernel_sol(tests):
@@ -1789,181 +1473,6 @@ def caffe_benchmark_gpu_trials():
 
 
 def single_node_comparison_benchmark():
-    def make_gather_frames(total_frames):
-        return []
-
-    def make_video_interval(total_frames):
-        # A range 100th of the video every 10th of the video
-        return [
-            (f - (total_frames / 100), f)
-            for f in range(total_frames / 10, total_frames + 1,
-                           total_frames / 10)]
-
-    small_video = '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'
-    small_video_frames = 139301
-    small_samplings = {
-        'all': ('all',),
-        'strided_short': ('strided', 30),
-        'strided_long': ('strided', 500),
-        'gather': ('gather', []),
-        'range': ('range', make_video_interval(small_video_frames)),
-        'hist_cpu_all': ('range', [[0, small_video_frames / 4]]),
-        'caffe_all': ('range', [[0, small_video_frames / 4]]),
-        'flow_cpu_all': ('range', [[0, small_video_frames / 100]]),
-        'flow_gpu_all': ('range', [[0, small_video_frames / 20]]),
-    }
-
-    large_video = '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'
-    large_video_frames = 200158
-    large_samplings = {
-        'all': ('all',),
-        'strided_short': ('strided', 30),
-        'strided_long': ('strided', 500),
-        'gather': ('gather', []),
-        'range': ('range', make_video_interval(large_video_frames)),
-        'hist_cpu_all': ('range', [[0, large_video_frames / 4]]),
-        'caffe_all': ('range', [[0, large_video_frames / 4]]),
-        'flow_cpu_all': ('range', [[0, large_video_frames / 100]]),
-        'flow_gpu_all': ('range', [[0, large_video_frames / 20]]),
-    }
-
-    tests = [
-    {'name': 'flow_cpu',
-     'sampling': 'flow_cpu_all',
-     'scanner_settings': {
-         'item_size': 64,
-         'cpu_pool': None,
-         'pipeline_instances_per_node': 32
-     }},
-        {'name': 'flow_gpu',
-         'sampling': 'flow_gpu_all',
-         'scanner_settings': {
-             'item_size': 1024,
-             'gpu_pool': '3G',
-             'pipeline_instances_per_node': 1
-         }},
-        {'name': 'histogram_cpu',
-         'sampling': 'hist_cpu_all',
-         'scanner_settings': {
-             'item_size': 1024,
-             'cpu_pool': '32G',
-             'pipeline_instances_per_node': 16
-         }},
-        {'name': 'histogram_gpu',
-         'sampling': 'all',
-         'scanner_settings': {
-             'item_size': 2048,
-             'gpu_pool': '6G',
-             'pipeline_instances_per_node': 1
-         }},
-        {'name': 'caffe',
-         'sampling': 'caffe_all',
-         'scanner_settings': {
-             'item_size': 2048,
-             'gpu_pool': '4G',
-             'pipeline_instances_per_node': 1
-         }},
-        # {'name': 'strided_hist_cpu',
-        #  'sampling': 'strided_short',
-        #  'scanner_settings': {
-        #      'item_size': 2048,
-        #      'gpu_pool': '6G',
-        #      'pipeline_instances_per_node': 1
-        #  }},
-        # {'name': 'strided_hist_cpu',
-        #  'ops': hist_cpu,
-        #  'frame_factor': 1,
-        #  'scanner_settings': {
-        #      'item_size': 2048,
-        #      'gpu_pool': '6G',
-        #      'pipeline_instances_per_node': 1
-        #  }},
-    {'name': 'gather_hist_gpu',
-     'sampling': 'strided_long',
-     'scanner_settings': {
-         'item_size': 4096,
-         'gpu_pool': '4G',
-         'pipeline_instances_per_node': 1
-     }},
-        {'name': 'gather_hist_cpu',
-         'sampling': 'strided_long',
-         'scanner_settings': {
-             'item_size': 4,
-             'cpu_pool': '90G',
-             'pipeline_instances_per_node': 8
-         }},
-        # {'name': 'gather_hist_cpu',
-        #  'ops': hist_gpu,
-        #  'frame_factor': 1,
-        #  'scanner_settings': {
-        #      'item_size': 2048,
-        #      'gpu_pool': '6G',
-        #      'pipeline_instances_per_node': 1
-        #  }},
-        # {'name': 'gather_hist_gpu',
-        #  'ops': hist_gpu,
-        #  'frame_factor': 1,
-        #  'scanner_settings': {
-        #      'item_size': 2048,
-        #      'gpu_pool': '6G',
-        #      'pipeline_instances_per_node': 1
-        #  }},
-        # {'name': 'range_hist_cpu',
-        #  'ops': hist_gpu,
-        #  'frame_factor': 1,
-        #  'scanner_settings': {
-        #      'item_size': 2048
-        #      'gpu_pool': '6G',
-        #      'pipeline_instances_per_node': 1
-        #  }},
-    # {'name': 'range_hist_gpu',
-    #  'sampling': 'range',
-    #  'scanner_settings': {
-    #      'item_size': 2048,
-    #      'gpu_pool': '6G',
-    #      'pipeline_instances_per_node': 1
-    #  }}
-    ]
-
-    # tests = [
-    # {'name': 'flow_cpu',
-    #  'sampling': 'flow_cpu_all',
-    #  'scanner_settings': {
-    #      'item_size': 256,
-    #      'cpu_pool': None,
-    #      'pipeline_instances_per_node': 1
-    #  }}]
-
-    # tests = [
-    #     {'name': 'gather_hist_gpu',
-    #      'sampling': 'strided_long',
-    #      'scanner_settings': {
-    #          'item_size': 4096,
-    #          'gpu_pool': '4G',
-    #          'pipeline_instances_per_node': 1
-    #      }},
-    #     {'name': 'gather_hist_cpu',
-    #      'sampling': 'strided_long',
-    #      'scanner_settings': {
-    #          'item_size': 4,
-    #          'cpu_pool': '90G',
-    #          'pipeline_instances_per_node': 8
-    #      }},
-    # ]
-
-    stests = []
-    for t in tests:
-        x = t.copy()
-        x['sampling'] = small_samplings[t['sampling']]
-        stests.append(x)
-
-    #scanner_results = scanner_benchmark(small_video, small_video_frames, stests)
-    scanner_results = {'caffe': [{'frames': 139301, 'results': (124.215575869, {'eval': {'caffe:net': '92.931810', 'caffe:transform_input': '10.751346', 'decode': '123.109152', 'evaluate': '105.083320', 'idle': '169.292046', 'init': '0.002564', 'memcpy': '0.111664', 'op_marshal': '0.199384', 'setup': '3.441307', 'task': '105.757011'}, 'load': {'idle': '249.801238', 'io': '4.098090', 'setup': '0.000026', 'task': '5.091766'}, 'save': {'idle': '265.077130', 'io': '2.716596', 'setup': '0.000023', 'task': '2.718703'}, 'total_time': '124.215576'})}], 'flow_cpu': [{'frames': 696, 'results': (13.034195915, {'eval': {'decode': '45.335426', 'evaluate': '165.289857', 'idle': '780.737544', 'init': '1.530940', 'op_marshal': '0.000214', 'setup': '2.700304', 'task': '165.330727'}, 'load': {'idle': '32.027327', 'io': '0.020475', 'setup': '0.000058', 'task': '0.762892'}, 'save': {'idle': '45.890137', 'io': '0.034020', 'setup': '0.000113', 'task': '0.039795'}, 'total_time': '13.034196'})}], 'flow_gpu': [{'frames': 6965, 'results': (45.439282773, {'eval': {'decode': '43.106413', 'evaluate': '45.140732', 'idle': '74.221661', 'init': '0.000686', 'memcpy': '0.009722', 'op_marshal': '0.014059', 'setup': '1.612254', 'task': '45.213637'}, 'load': {'idle': '53.903756', 'io': '0.244350', 'setup': '0.000059', 'task': '0.341566'}, 'save': {'idle': '105.342207', 'io': '0.288177', 'setup': '0.000010', 'task': '0.288527'}, 'total_time': '45.439283'})}], 'histogram_cpu': [{'frames': 139301, 'results': (32.297165602, {'eval': {'decode': '483.722451', 'evaluate': '408.317141', 'idle': '1074.992327', 'init': '2.765437', 'op_marshal': '0.002170', 'setup': '5.705983', 'task': '412.049338'}, 'load': {'idle': '20.057779', 'io': '5.851161', 'setup': '0.000032', 'task': '8.196627'}, 'save': {'idle': '83.579506', 'io': '0.861688', 'setup': '0.000069', 'task': '0.875858'}, 'total_time': '32.297166'})}], 'histogram_gpu': [{'frames': 139301, 'results': (33.553154557, {'eval': {'decode': '32.609033', 'evaluate': '14.324457', 'idle': '82.179450', 'init': '0.003078', 'memcpy': '0.106341', 'op_marshal': '0.201628', 'setup': '0.758748', 'task': '14.852671'}, 'load': {'idle': '78.701292', 'io': '3.914725', 'setup': '0.000020', 'task': '4.976457'}, 'save': {'idle': '85.108238', 'io': '1.875328', 'setup': '0.000112', 'task': '1.877589'}, 'total_time': '33.553155'})}], 'range_hist_gpu': [{'frames': 13930, 'results': (3.597061053, {'eval': {'decode': '3.302835', 'evaluate': '1.558980', 'idle': '35.531154', 'init': '0.000488', 'memcpy': '0.013573', 'op_marshal': '0.023253', 'setup': '0.149820', 'task': '1.613436'}, 'load': {'idle': '23.547049', 'io': '0.479616', 'setup': '0.000018', 'task': '0.612952'}, 'save': {'idle': '26.583728', 'io': '0.198355', 'setup': '0.000023', 'task': '0.198698'}, 'total_time': '3.597061'})}], 'strided_hist_long_gpu': [{'frames': 464, 'results': (3.716887399, {'eval': {'decode': '2.495283', 'evaluate': '0.056301', 'idle': '38.109545', 'init': '0.000893', 'memcpy': '0.003860', 'op_marshal': '0.004425', 'setup': '0.192161', 'task': '0.062307'}, 'load': {'idle': '10.001863', 'io': '0.824274', 'setup': '0.000027', 'task': '0.926700'}, 'save': {'idle': '13.622593', 'io': '0.025920', 'setup': '0.000119', 'task': '0.026030'}, 'total_time': '3.716887'})}], 'strided_hist_short_gpu': [{'frames': 4643, 'results': (28.891601876, {'eval': {'decode': '24.867581', 'evaluate': '0.497028', 'idle': '89.946550', 'init': '0.000483', 'memcpy': '0.007095', 'op_marshal': '0.017515', 'setup': '1.184723', 'task': '0.532347'}, 'load': {'idle': '20.007012', 'io': '5.262028', 'setup': '0.000045', 'task': '6.076579'}, 'save': {'idle': '74.641240', 'io': '0.068315', 'setup': '0.000005', 'task': '0.068445'}, 'total_time': '28.891602'})}]}
-    standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
-                          for k, v in scanner_results.iteritems()}
-    peak_results = scanner_results
-    # graph.comparison_graphs('small', 640, 480, standalone_results, scanner_results,
-    #                         peak_results)
 
     ltests = []
     for t in tests:
@@ -1971,16 +1480,7 @@ def single_node_comparison_benchmark():
         x['sampling'] = large_samplings[t['sampling']]
         ltests.append(x)
 
-    #standalone_results = standalone_benchmark(large_video, large_video_frames, ltests)
-    standalone_results = {'histogram_gpu': [{'frames': 200158, 'results': (208.96, {'load': 154.65, 'total': 208.96, 'setup': 0.15, 'save': 0.37, 'eval': 53.59})}], 'gather_hist_gpu': [{'frames': 400, 'results': (209.62, {'load': 0.33, 'total': 209.62, 'setup': 0.15, 'save': 0.0, 'eval': 0.12})}], 'flow_cpu': [{'frames': 333, 'results': (140.32, {'load': 1.41, 'total': 140.32, 'setup': 0.13, 'save': 0.0, 'eval': 138.91})}], 'histogram_cpu': [{'frames': 50039, 'results': (367.73, {'load': 145.82, 'total': 367.73, 'setup': 0.13, 'save': 0.05, 'eval': 221.79})}], 'flow_gpu': [{'frames': 10007, 'results': (232.46, {'load': 0.77, 'total': 232.46, 'setup': 0.28, 'save': 0.0, 'eval': 231.51})}], 'gather_hist_cpu': [{'frames': 400, 'results': (51.35, {'load': 2.37, 'total': 51.35, 'setup': 0.13, 'save': 0.0, 'eval': 3.73})}], 'caffe': [{'frames': 200158, 'results': (-1, {})}]}
-    scanner_results = {'caffe': [{'frames': 50039, 'results': (126.863404986, {'eval': {'caffe:net': '33.357140', 'caffe:transform_input': '66.319959', 'decode': '125.769289', 'evaluate': '100.174348', 'frames_decoded': 51320, 'frames_fed': 51643, 'frames_used': 50039, 'idle': '176.178832', 'init': '0.000490', 'memcpy': '0.020457', 'op_marshal': '0.030317', 'setup': '7.520566', 'task': '100.236231'}, 'load': {'idle': '229.027299', 'io': '2.452382', 'io_read': 507321797, 'setup': '0.001674', 'task': '3.056205'}, 'save': {'idle': '270.053932', 'io': '0.913868', 'io_write': 200556312, 'setup': '0.000248', 'task': '0.914203'}, 'total_time': '126.863405'})}], 'flow_cpu': [{'frames': 2001, 'results': (63.839779358, {'eval': {'decode': '205.726926', 'evaluate': '1768.963717', 'frames_decoded': 4085, 'frames_fed': 3685, 'frames_used': 2001, 'idle': '3163.768038', 'init': '0.681177', 'op_marshal': '0.000039', 'setup': '3.821897', 'task': '1769.154424'}, 'load': {'idle': '20.040472', 'io': '0.133431', 'io_read': 57562914, 'setup': '0.000163', 'task': '0.563751'}, 'save': {'idle': '147.624472', 'io': '0.006925', 'io_write': 18009, 'setup': '0.000857', 'task': '0.007475'}, 'total_time': '63.839779'})}], 'flow_gpu': [{'frames': 10007, 'results': (248.626166466, {'eval': {'decode': '238.256139', 'evaluate': '248.121545', 'frames_decoded': 10342, 'frames_fed': 10482, 'frames_used': 10007, 'idle': '275.726441', 'init': '0.002060', 'memcpy': '0.009847', 'op_marshal': '0.012221', 'setup': '3.580473', 'task': '248.186052'}, 'load': {'idle': '296.323660', 'io': '0.539573', 'io_read': 112728829, 'setup': '0.000282', 'task': '0.678909'}, 'save': {'idle': '496.894921', 'io': '0.569726', 'io_write': 90063, 'setup': '0.000303', 'task': '0.569924'}, 'total_time': '248.626166'})}], 'gather_hist_cpu': [{'frames': 400, 'results': (21.549662711, {'eval': {'decode': '165.283746', 'evaluate': '3.290798', 'frames_decoded': 37481, 'frames_fed': 40082, 'frames_used': 401, 'idle': '573.573771', 'init': '0.043311', 'op_marshal': '0.000037', 'setup': '1.580372', 'task': '3.292639'}, 'load': {'idle': '20.008724', 'io': '2.915937', 'io_read': 412212668, 'setup': '0.000196', 'task': '3.555391'}, 'save': {'idle': '62.876299', 'io': '0.018731', 'io_write': 80200, 'setup': '0.000054', 'task': '0.020275'}, 'total_time': '21.549663'})}], 'gather_hist_gpu': [{'frames': 400, 'results': (50.547078065, {'eval': {'decode': '46.507375', 'evaluate': '0.098743', 'frames_decoded': 42586, 'frames_fed': 45454, 'frames_used': 401, 'idle': '132.330747', 'init': '0.000372', 'memcpy': '0.005163', 'op_marshal': '0.005359', 'setup': '2.500418', 'task': '0.104367'}, 'load': {'idle': '10.003470', 'io': '2.651054', 'io_read': 412212668, 'setup': '0.000407', 'task': '3.141374'}, 'save': {'idle': '60.482490', 'io': '0.015511', 'io_write': 80200, 'setup': '0.000209', 'task': '0.015551'}, 'total_time': '50.547078'})}], 'histogram_cpu': [{'frames': 50039, 'results': (51.12213506, {'eval': {'decode': '708.187778', 'evaluate': '698.622058', 'frames_decoded': 52611, 'frames_fed': 52814, 'frames_used': 50039, 'idle': '1315.758985', 'init': '0.255978', 'op_marshal': '0.000204', 'setup': '2.810293', 'task': '698.773590'}, 'load': {'idle': '20.046779', 'io': '3.222126', 'io_read': 533254426, 'setup': '0.000052', 'task': '5.084221'}, 'save': {'idle': '119.417376', 'io': '0.067553', 'io_write': 10007800, 'setup': '0.000030', 'task': '0.068376'}, 'total_time': '51.122135'})}], 'histogram_gpu': [{'frames': 200158, 'results': (215.634761139, {'eval': {'decode': '213.731645', 'evaluate': '39.514628', 'frames_decoded': 205543, 'frames_fed': 206534, 'frames_used': 200158, 'idle': '418.698448', 'init': '0.000948', 'memcpy': '0.086007', 'op_marshal': '0.135303', 'setup': '4.463794', 'task': '39.757738'}, 'load': {'idle': '418.835705', 'io': '9.484100', 'io_read': 1972359963, 'setup': '0.000232', 'task': '11.587169'}, 'save': {'idle': '446.926429', 'io': '2.214957', 'io_write': 40031600, 'setup': '0.000180', 'task': '2.216198'}, 'total_time': '215.634761'})}]}
-    #scanner_results = scanner_benchmark(large_video, large_video_frames, ltests)
-    # standalone_results = {k: [{'frames': v[0]['frames'], 'results': (-1, {})}]
-    #                       for k, v in scanner_results.iteritems()}
-    # standalone_results['histogram_cpu'][0]['results'] = (1516.348484848, {})
-    # standalone_results['histogram_gpu'][0]['results'] = (209.809224319, {})
-    # standalone_results['flow_cpu'][0]['results'] = (716.195372751, {})
-    # standalone_results['flow_gpu'][0]['results'] = (162.672109, {})
+    standalone_results = standalone_benchmark(large_video, large_video_frames, ltests)
     standalone_results['caffe'][0]['results'] = (1021.214285714, {})
     peak_results = copy.deepcopy(scanner_results)
     peak_results['histogram_cpu'][0]['results'] = (50.692014531, {})
@@ -2175,48 +1675,317 @@ def surround360_single_node_benchmark():
             print('Surround360 scanner succeeded, took {:.3f}s'.format(elapsed))
         scanner_tests.append(elapsed)
 
+    print('CPUs', cpus)
+    print('Frames', num_frames)
+    print('Base')
+    print(base_tests)
+    print('Scanner')
+    print(scanner_tests)
     graph.surround360_single_node_graph(num_frames, cpus,
                                         base_tests, scanner_tests)
 
 
-def micro_comparison_driver():
+def make_video_interval(total_frames):
+    # A range 100th of the video every 10th of the video
+    return [
+        (f - (total_frames / 100), f)
+        for f in range(total_frames / 10, total_frames + 1,
+                       total_frames / 10)]
 
-    #decode_sol(tests, frame_counts)
-    tests = {
-        #'fight': ['/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'],
-        #'excalibur': ['/n/scanner/wrichto.new/videos/movies/excalibur.mp4'],
-        'mean': ['/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'],
+DATA_PREFIX = '/n/scanner/'
+SMALL_FC = 139301
+LARGE_FC = 202525
+VIDEOS = {
+    'small': {
+        'path': os.path.join(DATA_PREFIX,
+                             'datasets/movies/private/excalibur_1981.mp4'),
+        'frames': 139301,
+        'samplings': {
+            'all': ('all',),
+            'strided_short': ('strided', 30),
+            'strided_long': ('strided', 500),
+            'range': ('range', make_video_interval(SMALL_FC)),
+            'hist_cpu_all': ('range', [[0, SMALL_FC / 4]]),
+            'caffe_all': ('range', [[0, SMALL_FC / 4]]),
+            'flow_cpu_all': ('range', [[0, SMALL_FC / 100]]),
+            'flow_gpu_all': ('range', [[0, SMALL_FC / 20]]),
+        }
+    },
+    'large': {
+        'path': os.path.join(DATA_PREFIX,
+                             'datasets/movies/private/excalibur_1981.mp4'),
+        'frames': 202525,
+        'samplings': {
+            'all': ('all',),
+            'strided_short': ('strided', 30),
+            'strided_long': ('strided', 500),
+            'range': ('range', make_video_interval(LARGE_FC)),
+            'hist_cpu_all': ('range', [[0, LARGE_FC / 8]]),
+            'caffe_all': ('range', [[0, LARGE_FC / 8]]),
+            'flow_cpu_all': ('range', [[0, 384]]),
+            'flow_gpu_all': ('range', [[0, LARGE_FC / 20]]),
+        }
     }
-    frame_counts = {'charade': 163430,
-                    'fight': 200158,
-                    'excalibur': 202275,
-                    'mean': 139301
-    }
-    if 0:
-        #decode_sol(tests, frame_counts)
-        kernel_sol(tests)
+}
 
+
+def decode_sol():
+    video = VIDEOS['large']
+
+    def run_ocv_trial(ty, path):
+        print('Running ocv trial: {}'.format(path))
+        clear_filesystem_cache()
+        current_env = os.environ.copy()
+        start = time.time()
+        program_path = os.path.join(
+            COMPARISON_DIR, 'build/ocv_decode/ocv_decode')
+        p = subprocess.Popen([
+            program_path,
+            '--decoder', ty,
+            '--path', path,
+        ], env=current_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        so, se = p.communicate()
+        rc = p.returncode
+        elapsed = time.time() - start
+        timings = {}
+        if rc != 0:
+            print('Trial FAILED after {:.3f}s'.format(elapsed))
+            print(so)
+            elapsed = -1
+        else:
+            print('Trial succeeded, took {:.3f}s'.format(elapsed))
+            for line in so.splitlines():
+                if line.startswith('TIMING: '):
+                    k, s, v = line[len('TIMING: '):].partition(",")
+                    timings[k] = float(v)
+            elapsed = timings['total']
+        return elapsed, timings
+
+    def run_cmd(template, settings):
+        cmd = template.format(**settings)
+        if os.system(cmd) != 0:
+            print('Bad command: {}'.format(cmd))
+            exit()
+
+    ffmpeg_cpu_template = 'ffmpeg -vcodec h264 -i {path} -f null -'
+    ffmpeg_gpu_template = 'ffmpeg -vcodec h264_cuvid -i {path} -f null -'
+
+    video_path = video['path']
+    temp_video_path = '/tmp/vid'
+
+    os.system('rm -rf {}'.format(DB_PATH))
+    os.system('cp {} {}'.format(video_path, temp_video_path))
+
+    test_name = 'large'
+    frame_count = video['frames']
+    all_results = {}
+    all_results[test_name] = {}
+
+    # Scanner decode
+    with make_db() as db:
+        [table], failed_vids = db.ingest_videos(
+            [('decode_test', temp_video_path)], force=True)
+        assert len(failed_vids) == 0
+
+    with make_db() as db:
+        def decode_pipeline(frame, device, batch):
+            return db.ops.DiscardFrame(ignore=frame,
+                                       device=device,
+                                       batch=batch)
+
+        frame = table.as_op().all(task_size=768)
+        job = Job(columns=[decode_pipeline(frame, DeviceType.CPU, batch=192)],
+                  name='dummy')
+        succ, total, prof = run_trial(db, job)
+        assert succ
+        prof.write_trace('decode_cpu.trace')
+        all_results[test_name]['scanner_cpu'] = total
+
+    with make_db() as db:
+        def decode_pipeline(frame, device, batch):
+            return db.ops.DiscardFrame(ignore=frame,
+                                       device=device,
+                                       batch=batch)
+        frame = table.as_op().all(task_size=8192)
+        job = Job(columns=[decode_pipeline(frame, DeviceType.GPU, batch=256)],
+                  name='dummy')
+        succ, total, prof = run_trial(db, job,
+                                      {'gpu_pool': '2G',
+                                       'pipeline_instances_per_node': 1})
+        assert succ
+        prof.write_trace('decode_gpu.trace')
+        all_results[test_name]['scanner_gpu'] = total
+
+    # OCV decode
+    total, _ = run_ocv_trial('cpu', temp_video_path)
+    all_results[test_name]['opencv_cpu'] = total
+
+    total, _ = run_ocv_trial('gpu', temp_video_path)
+    all_results[test_name]['opencv_gpu'] = total
+
+    # FFMPEG CPU decode
+    start_time = time.time()
+    run_cmd(ffmpeg_cpu_template, {'path': temp_video_path})
+    all_results[test_name]['ffmpeg_cpu'] = time.time() - start_time
+
+    # FFMPEG GPU decode
+    start_time = time.time()
+    run_cmd(ffmpeg_gpu_template, {'path': temp_video_path})
+    all_results[test_name]['ffmpeg_gpu'] = time.time() - start_time
+
+    print('Decode test on ', video_path)
+    print("{:10s} | {:6s} | {:7s}".format('Type', 'Total', 'FPS'))
+    for ty, total in all_results[test_name].iteritems():
+        print("{:10s} | {:6.2f} | {:7.2f}".format(
+            ty, total, frame_count / total))
+
+    print(all_results)
+    return all_results
+
+
+def write_results():
+    pass
+
+def read_results():
+    pass
+
+def run_full_comparison(video, tests):
+    #standalone_results = standalone_benchmark(video, tests)
+    standalone_results = {'histogram_gpu': [{'frames': 202525, 'results': (280.71, {'load': 221.36, 'total': 280.71, 'setup': 0.18, 'save': 0.36, 'eval': 58.65})}], 'caffe': [{'frames': 25315, 'results': (1252.49, {'load': 897.11, 'save': 0.55, 'transform': 219.33, 'eval': 354.77, 'net': 135.42, 'total': 1252.49})}], 'flow_cpu': [{'frames': 384, 'results': (248.43, {'load': 2.05, 'total': 248.43, 'setup': 0.14, 'save': 0.0, 'eval': 246.37})}], 'histogram_cpu': [{'frames': 25315, 'results': (251.26, {'load': 100.29, 'total': 251.26, 'setup': 0.15, 'save': 0.03, 'eval': 150.85})}], 'flow_gpu': [{'frames': 10126, 'results': (398.3, {'load': 0.98, 'total': 398.3, 'setup': 0.3, 'save': 0.0, 'eval': 397.13})}]}
+    scanner_results = scanner_benchmark(video, tests)
+    peak_results = {} #peak_benchmark(video, tests)
+
+    return {'baseline': standalone_results,
+            'scanner': scanner_results,
+            'peak': peak_results}
+
+##
+def data_loading_benchmarks():
+    tests = [
+        {'name': 'decode_cpu',
+         'sampling': 'hist_cpu_all',
+         'scanner_settings': {
+             'task_size': 768,
+             'cpu_pool': '32G',
+             'pipeline_instances_per_node': 16
+         }},
+        {'name': 'decode_gpu',
+         'sampling': 'all',
+         'scanner_settings': {
+             'task_size': 8192,
+             'gpu_pool': '2G',
+             'pipeline_instances_per_node': 1
+         }},
+        # {'name': 'strided_hist_cpu',
+        #  'sampling': 'strided_short',
+        #  'scanner_settings': {
+        #      'task_size': 2048,
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+        # {'name': 'strided_hist_cpu',
+        #  'ops': hist_cpu,
+        #  'frame_factor': 1,
+        #  'scanner_settings': {
+        #      'task_size': 2048,
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+        {'name': 'gather_hist_gpu',
+         'sampling': 'strided_long',
+         'scanner_settings': {
+             'task_size': 4096,
+             'gpu_pool': '4G',
+             'pipeline_instances_per_node': 1
+         }},
+        {'name': 'gather_hist_cpu',
+         'sampling': 'strided_long',
+         'scanner_settings': {
+             'task_size': 4,
+             'cpu_pool': '90G',
+             'pipeline_instances_per_node': 8
+         }},
+        {'name': 'range_hist_cpu',
+         'ops': 'hist_gpu',
+         'frame_factor': 1,
+         'scanner_settings': {
+             'task_size': 2048,
+             'gpu_pool': '6g',
+             'pipeline_instances_per_node': 1
+         }},
+        {'name': 'range_hist_gpu',
+         'sampling': 'range',
+         'scanner_settings': {
+             'task_size': 2048,
+             'gpu_pool': '6g',
+             'pipeline_instances_per_node': 1
+         }}
+    ]
+    # decode
+    # stride
+    # gather
+    # range
+    # join
+
+##
+def micro_apps_benchmarks():
+    # histogram
+    # depth from stereo?
+    # dnn
+    # optical flow
+    tests = [
+        # {'name': 'histogram_cpu',
+        #  'sampling': 'hist_cpu_all',
+        #  'scanner_settings': {
+        #      'task_size': 1024,
+        #      'cpu_pool': '32G',
+        #      'pipeline_instances_per_node': 16
+        #  }},
+        # {'name': 'histogram_gpu',
+        #  'sampling': 'all',
+        #  'scanner_settings': {
+        #      'task_size': 2048,
+        #      'gpu_pool': '6G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+        # {'name': 'caffe',
+        #  'sampling': 'caffe_all',
+        #  'scanner_settings': {
+        #      'task_size': 2048,
+        #      'gpu_pool': '4G',
+        #      'pipeline_instances_per_node': 1
+        #  }},
+        {'name': 'flow_cpu',
+         'sampling': 'flow_cpu_all',
+         'scanner_settings': {
+             'task_size': 4,
+             'cpu_pool': None,
+             'pipeline_instances_per_node': 1
+         }},
+        {'name': 'flow_gpu',
+         'sampling': 'flow_gpu_all',
+         'scanner_settings': {
+             'task_size': 1024,
+             'gpu_pool': '3G',
+             'pipeline_instances_per_node': 1
+         }},
+    ]
+    results = run_full_comparison(VIDEOS['large'], tests)
+    pprint(results)
 
 BENCHMARKS = {
-    'multi_gpu': multi_gpu_benchmark,
-    'standalone': standalone_benchmark,
-    'scanner': scanner_benchmark,
-    'peak': peak_benchmark,
+    'load': data_loading_benchmarks,
+    'micro': micro_apps_benchmarks,
+    'enc': video_encoding_benchmark_2,
+    'surround360': surround360_single_node_benchmark,
+    'decode_sol': decode_sol,
+    'video': video_encoding_benchmark_2(),
 }
 
 
 def bench_main(args):
-    # surround360_single_node_benchmark()
-    video_encoding_benchmark_2()
-    # single_node_comparison_benchmark()
-    #striding_comparison_benchmark()
-    #multi_gpu_comparison_benchmark()
-    exit()
     test = args.test
     out_dir = args.output_directory
-    if test == 'all':
-        for name, fn in BENCHMARKS.iteritems():
-            fn()
-    else:
-        fn = BENCHMARKS[test]
-        fn()
+    assert test in BENCHMARKS
+    fn = BENCHMARKS[test]
+    fn()
