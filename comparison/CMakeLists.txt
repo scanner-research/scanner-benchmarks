@@ -25,6 +25,13 @@ find_package(Caffe REQUIRED)
 find_package(TinyToml REQUIRED)
 find_package(GFlags REQUIRED)
 find_package(Glog REQUIRED)
+find_package(FFmpeg REQUIRED)
+
+find_package(Halide REQUIRED)
+include(${CMAKE_SOURCE_DIR}/cmake/Util/HalideGenerator.cmake)
+include_directories("${HALIDE_INCLUDE_DIR}")
+include_directories("${PROJECT_BINARY_DIR}/generator_genfiles")
+
 
 find_package(CUDA REQUIRED)
 
@@ -33,6 +40,10 @@ add_definitions(-DHAVE_CUDA)
 
 include_directories(
   "."
+  ${SCANNER_ROOT_DIR}
+  ${SCANNER_ROOT_DIR}/build
+  ${SCANNER_ROOT_DIR}/thirdparty/storehouse/
+  ${FFMPEG_INCLUDE_DIR}
   ${Boost_INCLUDE_DIRS}
   ${CUDA_INCLUDE_DIRS}
   ${CAFFE_INCLUDE_DIRS}
@@ -40,6 +51,10 @@ include_directories(
   ${TINYTOML_INCLUDE_DIR})
 
 set(LIBRARIES
+  ${SCANNER_ROOT_DIR}/build/libscanner.so
+  ${FFMPEG_LIBRARIES}
+  "/opt/ffmpeg-3.2.2/lib/libswscale.so"
+  ${HALIDE_LIBRARIES}
   ${OpenCV_LIBRARIES}
   ${Boost_LIBRARIES}
   ${CAFFE_LIBRARIES}
@@ -70,7 +85,7 @@ endmacro()
 
 add_subdirectory(util)
 add_subdirectory(standalone)
-#add_subdirectory(peak)
+add_subdirectory(peak)
 add_subdirectory(ocv_decode)
 #add_subdirectory(kernel_sol)
 #add_subdirectory(readwrite)

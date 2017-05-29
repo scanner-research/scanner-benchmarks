@@ -50,7 +50,7 @@ def make_db(opts={}):
 def run_trial(db, jobs, opts={}):
     print('Running trial...')
     # Clear cache
-    scanner_opts = {}
+    scanner_opts = {'profiling': True}
     def add_opt(s):
         if s in opts:
             scanner_opts[s] = opts[s]
@@ -1720,8 +1720,8 @@ VIDEOS = {
             'strided_short': ('strided', 30),
             'strided_long': ('strided', 500),
             'range': ('range', make_video_interval(LARGE_FC)),
-            'hist_cpu_all': ('range', [[0, LARGE_FC / 8]]),
-            'caffe_all': ('range', [[0, LARGE_FC / 8]]),
+            'hist_cpu_all': ('range', [[0, LARGE_FC / 6]]),
+            'caffe_all': ('range', [[0, LARGE_FC / 6]]),
             'flow_cpu_all': ('range', [[0, 384]]),
             'flow_gpu_all': ('range', [[0, LARGE_FC / 20]]),
         }
@@ -1934,33 +1934,33 @@ def micro_apps_benchmarks():
     # dnn
     # optical flow
     tests = [
-        # {'name': 'histogram_cpu',
-        #  'sampling': 'hist_cpu_all',
-        #  'scanner_settings': {
-        #      'task_size': 1024,
-        #      'cpu_pool': '32G',
-        #      'pipeline_instances_per_node': 16
-        #  }},
-        # {'name': 'histogram_gpu',
-        #  'sampling': 'all',
-        #  'scanner_settings': {
-        #      'task_size': 2048,
-        #      'gpu_pool': '6G',
-        #      'pipeline_instances_per_node': 1
-        #  }},
-        # {'name': 'caffe',
-        #  'sampling': 'caffe_all',
-        #  'scanner_settings': {
-        #      'task_size': 2048,
-        #      'gpu_pool': '4G',
-        #      'pipeline_instances_per_node': 1
-        #  }},
+        {'name': 'histogram_cpu',
+         'sampling': 'hist_cpu_all',
+         'scanner_settings': {
+             'task_size': 1024,
+             'cpu_pool': None,
+             'pipeline_instances_per_node': 16
+         }},
+        {'name': 'histogram_gpu',
+         'sampling': 'all',
+         'scanner_settings': {
+             'task_size': 2048,
+             'gpu_pool': '6G',
+             'pipeline_instances_per_node': 1
+         }},
+        {'name': 'caffe',
+         'sampling': 'caffe_all',
+         'scanner_settings': {
+             'task_size': 2048,
+             'gpu_pool': '4G',
+             'pipeline_instances_per_node': 1
+         }},
         {'name': 'flow_cpu',
          'sampling': 'flow_cpu_all',
          'scanner_settings': {
              'task_size': 4,
              'cpu_pool': None,
-             'pipeline_instances_per_node': 1
+             'pipeline_instances_per_node': 32
          }},
         {'name': 'flow_gpu',
          'sampling': 'flow_gpu_all',
@@ -1979,7 +1979,7 @@ BENCHMARKS = {
     'enc': video_encoding_benchmark_2,
     'surround360': surround360_single_node_benchmark,
     'decode_sol': decode_sol,
-    'video': video_encoding_benchmark_2(),
+    'video': video_encoding_benchmark_2,
 }
 
 

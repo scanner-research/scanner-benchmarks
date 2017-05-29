@@ -13,19 +13,21 @@
  * limitations under the License.
  */
 
-#include "peak_video_decoder.h"
+#include "peak_cpu_video_decoder.h"
+#include "peak_gpu_video_decoder.h"
 
-#include "util/queue.h"
 // #include "scanner/util/util.h"
 // #include "scanner/util/h264.h"
-// #include "scanner/engine/halide_context.h"
 
 #include "util/net_descriptor.h"
 #include "caffe/blob.hpp"
 #include "caffe/data_transformer.hpp"
+#include "caffe/net.hpp"
 
-//#include "caffe_input_transformer_gpu/caffe_input_transformer_gpu.h"
+#include "generator_genfiles/caffe_input_transformer_gpu/caffe_input_transformer_gpu.h"
 #include "HalideRuntimeCuda.h"
+#include "Halide.h"
+#include "scanner/util/halide_context.h"
 
 #include <boost/program_options/options_description.hpp>
 #include <boost/program_options/variables_map.hpp>
@@ -63,9 +65,7 @@ using namespace scanner;
 namespace po = boost::program_options;
 namespace cvc = cv::cuda;
 
-using scanner::NetDescriptor;
 using scanner::Queue;
-
 
 enum OpType {
   Histogram,
@@ -150,7 +150,7 @@ bool setup_video_codec(CodecState& state, const std::string& path) {
     return false;
   }
 
-  LOG(INFO) << "Dimp format";
+  LOG(INFO) << "Dump format";
   av_dump_format(state.format_context, 0, NULL, 0);
 
   // Find the best video stream in our input video
@@ -782,8 +782,8 @@ void video_caffe_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
 
   NetDescriptor descriptor;
   {
-    std::ifstream net_file{NET_PATH};
-    descriptor = scanner::descriptor_from_net_file(net_file);
+    //std::ifstream net_file{NET_PATH};
+    descriptor = descriptor_from_net_file(NET_PATH);
   }
 
   // Set ourselves to the correct GPU
