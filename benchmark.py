@@ -200,6 +200,61 @@ def get_trial_total_io_read(result):
             total_io += counters['io_read'] if 'io_read' in counters else 0
     return total_io
 
+def cpm_ablation_benchmark():
+    input_video = '/n/scanner/wcrichto/videos/meanGirls_medium.mp4'
+    with Database() as db:
+        if not db.has_table(input_video):
+            db.ingest_videos([(input_video, input_video)])
+
+        descriptor = NetDescriptor.from_file(db, 'nets/cpm2.toml')
+        cpm2_args = db.protobufs.CPM2Args()
+        cpm2_args.scale = 368.0/720.0
+        caffe_args = cpm2_args.caffe_args
+        caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
+
+        def run(k, gpu_pool=None, cpu_pool=None, batch_size=1):
+            frame = db.table(input_video).as_op().range(0, 100, item_size = 100)
+            frame_info = db.ops.InfoFromFrame(frame = frame)
+            caffe_args.batch_size = 1 #batch_size
+            cpm2_input = db.ops.CPM2Input(
+                frame = frame,
+                args = cpm2_args,
+                device = DeviceType.GPU)
+            cpm2_resized_map, cpm2_joints = db.ops.CPM2(
+                cpm2_input = cpm2_input,
+                args = cpm2_args,
+                device = DeviceType.GPU)
+            poses = db.ops.CPM2Output(
+                cpm2_resized_map = cpm2_resized_map,
+                cpm2_joints = cpm2_joints,
+                original_frame_info = frame_info,
+                args = cpm2_args)
+            job = Job(columns = [poses], name = 'example_poses')
+            start = now()
+            clear_filesystem_cache()
+            output = db.run(job,
+                            force=True,
+                            work_item_size = batch_size,
+                            pipeline_instances_per_node=1,
+                            cpu_pool=cpu_pool,
+                            gpu_pool=gpu_pool)
+            t = now() - start
+            output.profiler().write_trace('{}.trace'.format(k))
+            return t
+
+        options = {}
+        values = [
+            ('batch_size', 100)]
+            # ('gpu_pool', '10G'),
+            # ('cpu_pool', 'p100G')]
+        #timings = [('baseline', run('baseline'))]
+        timings = []
+        for (k, v) in values:
+            options[k] = v
+            t = run(k, cpu_pool='p100G', **options)
+            timings.append((k, t))
+            pprint(timings)
+
 
 # TODO: re-encode video from stride
 def video_encoding_benchmark_2():
@@ -247,7 +302,7 @@ def video_encoding_benchmark_2():
             'img_gpu': {}
         }
 
-        for scale in [2, 4, 8]:
+        for scale in [1, 2, 4, 8]:
             width = (input_width / scale) // 2 * 2
             height = (input_height / scale) // 2 * 2
 
@@ -280,24 +335,20 @@ def video_encoding_benchmark_2():
             for k in times:
                 times[k][scale] = {}
 
-            for stride in [1]:
+            for stride in [1, 4, 16, 64]:
                 if stride == 1:
                     fn = lambda item: lambda t: t.all(item_size=item)
                 else:
                     fn = lambda item: lambda t: t.strided(stride, item_size=item)
 
-                # t = decode(vid_names, fn(1000), profile='vid_cpu_{}'.format(scale))
+                t = decode(vid_names, fn(1000)) #profile='vid_cpu_{}'.format(scale))
+                times['vid_cpu'][scale][stride] = t
 
-                # times['vid_cpu'][scale][stride] = t
-
-                t = decode(vid_names, fn(1000), device = DeviceType.GPU, profile='vid_gpu_{}'.format(scale))
-
+                t = decode(vid_names, fn(1000), device = DeviceType.GPU)  #profile='vid_gpu_{}'.format(scale))
                 times['vid_gpu'][scale][stride] = t
 
-                # t = decode(img_names, fn(10), image = True)
-                #                #profile = 'img_cpu_{}'.format(stride))
-                # #
-                # times['img_cpu'][scale][stride] = t
+                t = decode(img_names, fn(10), image = True) #profile = 'img_cpu_{}'.format(stride))
+                times['img_cpu'][scale][stride] = t
 
                 # t = decode(img_names, fn(10), image = True, device = DeviceType.GPU)
                 # times['img_gpu'][scale][stride] = t
@@ -1984,6 +2035,13 @@ BENCHMARKS = {
 
 
 def bench_main(args):
+    # surround360_single_node_benchmark()
+    video_encoding_benchmark_2()
+    # cpm_ablation_benchmark()
+    # single_node_comparison_benchmark()
+    #striding_comparison_benchmark()
+    #multi_gpu_comparison_benchmark()
+    exit()
     test = args.test
     out_dir = args.output_directory
     assert test in BENCHMARKS
