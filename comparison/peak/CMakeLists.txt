@@ -21,5 +21,6 @@ if(CUDA_FOUND AND OpenCV_FOUND)
     halide_add_aot_library_dependency(peak_comparison ${TARGET})
   endforeach()
   target_link_libraries(peak_comparison PRIVATE
+    -L${SCANNER_ROOT_DIR}/build/
     scanner_halide)
 endif()

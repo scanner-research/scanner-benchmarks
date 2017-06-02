@@ -91,11 +91,11 @@ using WorkerFn = std::function<void(int, Queue<u8 *> &, Queue<BufferHandle> &,
                                     Queue<SaveHandle> &, Queue<SaveHandle> &)>;
 
 const int NUM_BUFFERS = 5;
-int BATCH_SIZE = 192;      // Batch size for network
-const int NET_BATCH_SIZE = 96;      // Batch size for network
+int BATCH_SIZE = 128;      // Batch size for network
+const int NET_BATCH_SIZE = 128;      // Batch size for network
 const int FLOW_WORK_REDUCTION = 20;
 const int BINS = 16;
-const std::string NET_PATH = "features/googlenet.toml";
+const std::string NET_PATH = "nets/googlenet.toml";
 
 int GPUS_PER_NODE = 1;           // GPUs to use per node
 int width;
@@ -107,6 +107,9 @@ std::string PATH;
 std::string OPERATION;
 std::mutex TIMINGS_MUTEX;
 std::map<std::string, double> TIMINGS;
+
+std::string DECODE_TYPE;
+std::string DECODE_ARGS;
 
 bool IS_CPU;
 
@@ -428,7 +431,8 @@ void save_worker(int gpu_device_id, Queue<SaveHandle> &save_buffers,
       cudaStreamSynchronize(handle.stream);
     }
     // Write out
-    if (OPERATION != "flow") {
+    if (OPERATION != "flow_cpu" &&
+        OPERATION != "flow_gpu") {
       outfile.write((char*)buf, output_element_size * handle.elements);
     }
     save_time += scanner::nano_since(save_start);
@@ -441,6 +445,82 @@ void save_worker(int gpu_device_id, Queue<SaveHandle> &save_buffers,
   std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
   TIMINGS["save"] += save_time;
   //cudaFreeHost(buf);
+}
+
+void video_decode_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
+                             Queue<BufferHandle> &decoded_frames,
+                             Queue<SaveHandle> &free_output_buffers,
+                             Queue<SaveHandle> &save_buffers) {
+  double setup_time = 0;
+  double load_time = 0;
+  double histo_time = 0;
+  double save_time = 0;
+
+  int frame_size = width * height * 4 * sizeof(u8);
+
+  auto setup_start = scanner::now();
+
+  int64_t frame = 0;
+  while (true) {
+    BufferHandle buffer_handle;
+    decoded_frames.pop(buffer_handle);
+    u8* buffer = buffer_handle.buffer;
+    int elements = buffer_handle.elements;
+    if (buffer == nullptr) {
+      break;
+    }
+
+    SaveHandle save_handle;
+    free_output_buffers.pop(save_handle);
+    u8* output_buffer = save_handle.buffer;
+    save_handle.elements = elements;
+
+    save_buffers.push(save_handle);
+    free_buffers.push(buffer);
+  }
+  std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
+  TIMINGS["setup"] += setup_time;
+  TIMINGS["load"] += load_time;
+  TIMINGS["eval"] += histo_time;
+  TIMINGS["save"] += save_time;
+}
+
+void video_decode_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
+                         Queue<BufferHandle> &decoded_frames,
+                         Queue<SaveHandle> &free_output_buffers,
+                         Queue<SaveHandle> &save_buffers) {
+  double setup_time = 0;
+  double load_time = 0;
+  double histo_time = 0;
+  double save_time = 0;
+
+  int frame_size = width * height * 4 * sizeof(u8);
+
+  auto setup_start = scanner::now();
+
+  int64_t frame = 0;
+  while (true) {
+    BufferHandle buffer_handle;
+    decoded_frames.pop(buffer_handle);
+    u8* buffer = buffer_handle.buffer;
+    int elements = buffer_handle.elements;
+    if (buffer == nullptr) {
+      break;
+    }
+
+    SaveHandle save_handle;
+    free_output_buffers.pop(save_handle);
+    u8* output_buffer = save_handle.buffer;
+    save_handle.elements = elements;
+
+    save_buffers.push(save_handle);
+    free_buffers.push(buffer);
+  }
+  std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
+  TIMINGS["setup"] += setup_time;
+  TIMINGS["load"] += load_time;
+  TIMINGS["eval"] += histo_time;
+  TIMINGS["save"] += save_time;
 }
 
 void video_histogram_cpu_worker(int gpu_device_id,
@@ -590,6 +670,7 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
 
   auto flow = cv::FarnebackOpticalFlow::create(3, 0.5, false, 15, 3, 5, 1.2, 0);
 
+  bool first = true;
   int64_t frame = 0;
   while (true) {
     BufferHandle buffer_handle;
@@ -606,22 +687,25 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
 
     u8* output_buffer = save_handle.buffer;
 
-    printf("elements %d\n", elements);
     // Load the first frame
     auto eval_first = scanner::now();
-    cv::Mat image(height, width, CV_8UC3, buffer);
-    cv::cvtColor(image, gray[0], CV_BGR2GRAY);
+    int i = 0;
+    if (first) {
+      cv::Mat image(height, width, CV_8UC3, buffer);
+      cv::cvtColor(image, gray[0], CV_BGR2GRAY);
+      i += 1;
+      first = false;
+    }
     eval_time += scanner::nano_since(eval_first);
     bool done = false;
-    for (int i = 1; i < elements; ++i) {
-      int curr_idx = i % 2;
-      int prev_idx = (i - 1) % 2;
+    for (; i < elements; ++i) {
+      int curr_idx = (i + 1) % 2;
+      int prev_idx = (i) % 2;
       cv::Mat output_flow(height, width, CV_32FC2,
                           output_buffer + i * output_element_size);
       cv::Mat image(height, width, CV_8UC3, buffer + i * frame_size);
 
       auto eval_start = scanner::now();
-      printf("curr %d, prev %d\n", curr_idx, prev_idx);
       cv::cvtColor(image, gray[curr_idx], CV_BGR2GRAY);
       flow->calc(gray[prev_idx], gray[curr_idx], output_flow);
       eval_time += scanner::nano_since(eval_start);
@@ -653,7 +737,8 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
     gray.emplace_back(height, width, CV_8UC1);
   }
 
-  cv::Ptr<cvc::DenseOpticalFlow> flow = cvc::FarnebackOpticalFlow::create();
+  cv::Ptr<cvc::DenseOpticalFlow> flow =
+      cvc::FarnebackOpticalFlow::create(3, 0.5, false, 15, 3, 5, 1.2, 0);
 
   int64_t frame = 0;
   while (true) {
@@ -910,17 +995,19 @@ int main(int argc, char** argv) {
         "operation", po::value<std::string>()->required(),
         "histogram, flow, or caffe")(
 
-        "decoder_count", po::value<int>()->required(),
-        "Number of decoders")(
+        "decode_type", po::value<std::string>()->required(),
+        "all, stride, gather, range")(
 
-        "eval_count", po::value<int>()->required(),
-        "Number of eval routines")(
+        "decode_args", po::value<std::string>()->required(), "")(
 
-        "width", po::value<int>()->required(),
-        "Width of video.")(
+        "decoder_count", po::value<int>()->required(), "Number of decoders")(
 
-        "height", po::value<int>()->required(),
-        "Height of video.");
+        "eval_count", po::value<int>()->required(), "Number of eval routines")(
+
+        "width", po::value<int>()->required(), "Width of video.")(
+
+        "height", po::value<int>()->required(), "Height of video.");
+
     try {
       po::store(po::parse_command_line(argc, argv, desc), vm);
       po::notify(vm);
@@ -933,6 +1020,8 @@ int main(int argc, char** argv) {
       video_list_path = vm["video_list_path"].as<std::string>();
 
       OPERATION = vm["operation"].as<std::string>();
+      DECODE_TYPE = vm["decode_type"].as<std::string>();
+      DECODE_ARGS = vm["decode_args"].as<std::string>();
       decoder_count = vm["decoder_count"].as<int>();
       eval_count = vm["eval_count"].as<int>();
 
@@ -953,7 +1042,14 @@ int main(int argc, char** argv) {
 
   DecoderFn decoder_fn;
   WorkerFn worker_fn;
-  if (OPERATION == "histogram_cpu") {
+  if (OPERATION == "decoder_cpu") {
+    cpu_decoder = true;
+    worker_fn = video_decode_worker;
+    output_element_size = 0;
+  } else if (OPERATION == "decoder_gpu") {
+    worker_fn = video_decode_worker;
+    output_element_size = 0;
+  } else if (OPERATION == "histogram_cpu") {
     cpu_decoder = true;
     worker_fn = video_histogram_cpu_worker;
     output_element_size = 3 * BINS * sizeof(i32);
@@ -962,6 +1058,7 @@ int main(int argc, char** argv) {
     output_element_size = 3 * BINS * sizeof(i32);
   } else if (OPERATION == "flow_cpu") {
     BATCH_SIZE = 8;      // Batch size for network
+    BATCH_SIZE = 1;      // Batch size for network
     cpu_decoder = true;
     worker_fn = video_flow_cpu_worker;
     output_element_size = 2 * height * width * sizeof(f32);
@@ -991,10 +1088,11 @@ int main(int argc, char** argv) {
 
   cudaSetDevice(0);
   // Create decoded frames buffers and output buffers
-  Queue<u8*> free_buffers;
-  Queue<BufferHandle> decoded_frames;
-  Queue<SaveHandle> free_output_buffers;
-  Queue<SaveHandle> save_buffers;
+  i32 queue_size = 1000;
+  Queue<u8*> free_buffers(queue_size);
+  Queue<BufferHandle> decoded_frames(queue_size);
+  Queue<SaveHandle> free_output_buffers(queue_size);
+  Queue<SaveHandle> save_buffers(queue_size);
   for (int i = 0; i < NUM_BUFFERS * std::max(decoder_count, eval_count);
        ++i) {
     if (IS_CPU) {
@@ -1038,7 +1136,7 @@ int main(int argc, char** argv) {
                           std::ref(free_output_buffers));
 
   // Insert video paths into work queue
-  Queue<std::string> video_paths;
+  Queue<std::string> video_paths(10000);
   {
     std::ifstream infile(video_list_path);
     std::string line;

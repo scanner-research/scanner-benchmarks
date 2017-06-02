@@ -404,10 +404,14 @@ def standalone_graphs(frame_counts, results):
 
 
 def comparison_graphs(name,
-                      width, height,
+                      video,
                       standalone_results, scanner_results,
                       peak_results,
                       labels_on=True):
+
+    width = video['width']
+    height = video['height']
+
     scale = 2.5
     w = 3.33 * scale
     h = 1.25 * scale
@@ -431,16 +435,22 @@ def comparison_graphs(name,
     #           'RANGE',
     #           'FLOWCPU', 'FLOWGPU',
     #           'DNN']
+    # ops = ['histogram_cpu', 'histogram_gpu',
+    #        'flow_cpu', 'flow_gpu',
+    #        'caffe',
+    #        'gather_hist_cpu',
+    #        'gather_hist_gpu']
+    # labels = ['HISTCPU', 'HISTGPU',
+    #           'FLOWCPU', 'FLOWGPU',
+    #           'DNN',
+    #           'GATHERCPU',
+    #           'GATHERGPU']
     ops = ['histogram_cpu', 'histogram_gpu',
            'flow_cpu', 'flow_gpu',
-           'caffe',
-           'gather_hist_cpu',
-           'gather_hist_gpu']
+           'caffe']
     labels = ['HISTCPU', 'HISTGPU',
               'FLOWCPU', 'FLOWGPU',
-              'DNN',
-              'GATHERCPU',
-              'GATHERGPU']
+              'DNN']
 
     #for test_name, tests in results.iteritems():
     if 1:
