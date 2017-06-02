@@ -272,15 +272,15 @@ def video_encoding_benchmark_2():
                 if image:
                     frame = db.ops.ImageDecoder(
                         img = frame,
-                        image_type = db.protobufs.ImageDecoderArgs.JPEG)
-                dummy = db.ops.DiscardFrame(ignore = frame, device = device)
+                        image_type = db.protobufs.ImageDecoderArgs.JPEG,
+                        batch = 10)
+                dummy = db.ops.DiscardFrame(ignore = frame, device = device, batch = 10)
                 job = Job(columns = [dummy], name = 'ignore_{}'.format(t.name()))
                 jobs.append(job)
 
             clear_filesystem_cache()
             start = now()
-            out = db.run(jobs, force = True, work_item_size = 10,
-                             show_progress = True)
+            out = db.run(jobs, force = True, show_progress = True)
                              #pipeline_instances_per_node = 1)
             t = now() - start
             if profile is not None:
@@ -302,7 +302,7 @@ def video_encoding_benchmark_2():
             'img_gpu': {}
         }
 
-        for scale in [1, 2, 4, 8]:
+        for scale in [8]:
             width = (input_width / scale) // 2 * 2
             height = (input_height / scale) // 2 * 2
 
@@ -318,7 +318,7 @@ def video_encoding_benchmark_2():
                         device = DeviceType.CPU)
                     job = Job(columns = [resized], name = vid_name)
                     t = now()
-                    out = db.run(job, force = True, work_item_size=1)
+                    out = db.run(job, force = True)
                     print('{:.3f}'.format(now() - t))
                     #out.profiler().write_trace('resized.trace')
 
@@ -329,17 +329,17 @@ def video_encoding_benchmark_2():
                     img = db.ops.ImageEncoder(frame = frame)
                     job = Job(columns = [img], name = img_name)
                     t = now()
-                    db.run(job, force = True, work_item_size=1)
+                    db.run(job, force = True)
                     print('{:.3f}'.format(now() - t))
 
             for k in times:
                 times[k][scale] = {}
 
-            for stride in [1, 4, 16, 64]:
+            for stride in [1, 4]:
                 if stride == 1:
-                    fn = lambda item: lambda t: t.all(item_size=item)
+                    fn = lambda item: lambda t: t.all(task_size=item)
                 else:
-                    fn = lambda item: lambda t: t.strided(stride, item_size=item)
+                    fn = lambda item: lambda t: t.strided(stride, task_size=item)
 
                 t = decode(vid_names, fn(1000)) #profile='vid_cpu_{}'.format(scale))
                 times['vid_cpu'][scale][stride] = t
