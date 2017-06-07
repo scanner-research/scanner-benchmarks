@@ -202,7 +202,7 @@ def get_trial_total_io_read(result):
     return total_io
 
 def cpm_ablation_benchmark():
-    input_video = '/n/scanner/wcrichto/videos/meanGirls_medium.mp4'
+    input_video = '/home/will/data/meanGirls_medium.mp4'
     with Database() as db:
         if not db.has_table(input_video):
             db.ingest_videos([(input_video, input_video)])
@@ -213,46 +213,61 @@ def cpm_ablation_benchmark():
         caffe_args = cpm2_args.caffe_args
         caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
 
-        def run(k, gpu_pool=None, cpu_pool=None, batch_size=1):
-            frame = db.table(input_video).as_op().range(0, 100, item_size = 100)
+        def run(k, gpu_pool=None, cpu_pool=None, batch_size=1, tasks_in_queue_per_pu=1, pipelines=1):
+            frame = db.table(input_video).as_op().range(0, 2000, task_size = 50)
             frame_info = db.ops.InfoFromFrame(frame = frame)
-            caffe_args.batch_size = 1 #batch_size
+            caffe_args.batch_size = 1
             cpm2_input = db.ops.CPM2Input(
                 frame = frame,
                 args = cpm2_args,
-                device = DeviceType.GPU)
+                device = DeviceType.GPU,
+                batch = batch_size)
             cpm2_resized_map, cpm2_joints = db.ops.CPM2(
                 cpm2_input = cpm2_input,
                 args = cpm2_args,
-                device = DeviceType.GPU)
+                device = DeviceType.GPU,
+                batch = batch_size)
             poses = db.ops.CPM2Output(
                 cpm2_resized_map = cpm2_resized_map,
                 cpm2_joints = cpm2_joints,
                 original_frame_info = frame_info,
-                args = cpm2_args)
+                args = cpm2_args,
+                batch = batch_size)
             job = Job(columns = [poses], name = 'example_poses')
             start = now()
             clear_filesystem_cache()
             output = db.run(job,
                             force=True,
-                            work_item_size = batch_size,
-                            pipeline_instances_per_node=1,
+                            pipeline_instances_per_node=pipelines,
                             cpu_pool=cpu_pool,
-                            gpu_pool=gpu_pool)
-            t = now() - start
-            output.profiler().write_trace('{}.trace'.format(k))
+                            gpu_pool=gpu_pool,
+                            tasks_in_queue_per_pu=tasks_in_queue_per_pu,
+                            profiling=True)
+            prof = output.profiler()
+            elapsed = now() - start
+            total = prof.total_time_interval()
+            t = (total[1] - total[0])
+            t /= float(1e9)  # ns to s
+            prof.write_trace('{}.trace'.format(k))
             return t
 
-        options = {}
+        options = {
+            # 'tasks_in_queue_per_pu': 4,
+            # 'batch_size': 50,
+            # 'pipelines': 4,
+            # 'gpu_pool': '4G'
+        }
         values = [
-            ('batch_size', 100)]
-            # ('gpu_pool', '10G'),
-            # ('cpu_pool', 'p100G')]
-        #timings = [('baseline', run('baseline'))]
-        timings = []
+            ('pipelines', 4),
+            ('tasks_in_queue_per_pu', 4),
+            ('batch_size', 50),
+            ('gpu_pool', '4G'),
+            ('cpu_pool', 'p90G')]
+        timings = [('baseline', run('baseline'))]
+        # timings = []
         for (k, v) in values:
             options[k] = v
-            t = run(k, cpu_pool='p100G', **options)
+            t = run(k, **options)
             timings.append((k, t))
             pprint(timings)
 
@@ -2100,17 +2115,10 @@ BENCHMARKS = {
     'enc': video_encoding_benchmark_2,
     'surround360': surround360_single_node_benchmark,
     'decode_sol': decode_sol,
+    'cpm': cpm_ablation_benchmark
 }
 
-
 def bench_main(args):
-    # surround360_single_node_benchmark()
-    video_encoding_benchmark_2()
-    # cpm_ablation_benchmark()
-    # single_node_comparison_benchmark()
-    #striding_comparison_benchmark()
-    #multi_gpu_comparison_benchmark()
-    exit()
     test = args.test
     out_dir = args.output_directory
     assert test in BENCHMARKS
