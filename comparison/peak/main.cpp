@@ -19,6 +19,11 @@
 // #include "scanner/util/util.h"
 // #include "scanner/util/h264.h"
 
+#include "scanner/engine/video_index_entry.h"
+#include "scanner/engine/load_worker.h"
+#include "scanner/video/decoder_automata.h"
+#include "scanner/util/profiler.h"
+
 #include "util/net_descriptor.h"
 #include "caffe/blob.hpp"
 #include "caffe/data_transformer.hpp"
@@ -28,6 +33,10 @@
 #include "HalideRuntimeCuda.h"
 #include "Halide.h"
 #include "scanner/util/halide_context.h"
+
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <thread>
 
 #include <boost/program_options/options_description.hpp>
 #include <boost/program_options/variables_map.hpp>
@@ -84,13 +93,13 @@ struct SaveHandle {
   int elements;
 };
 
-using DecoderFn = std::function<void(int, Queue<std::string>&, Queue<u8*> &,
+using DecoderFn = std::function<void(int, Queue<int64_t>&, Queue<u8*> &,
                                      Queue<BufferHandle> &)>;
 
 using WorkerFn = std::function<void(int, Queue<u8 *> &, Queue<BufferHandle> &,
                                     Queue<SaveHandle> &, Queue<SaveHandle> &)>;
 
-const int NUM_BUFFERS = 5;
+const int NUM_BUFFERS = 3;
 int BATCH_SIZE = 128;      // Batch size for network
 const int NET_BATCH_SIZE = 128;      // Batch size for network
 const int FLOW_WORK_REDUCTION = 20;
@@ -110,6 +119,14 @@ std::map<std::string, double> TIMINGS;
 
 std::string DECODE_TYPE;
 std::string DECODE_ARGS;
+
+std::vector<std::string> VIDEO_PATHS;
+std::vector<std::tuple<int64_t, int64_t>> TASK_RANGES;
+
+scanner::internal::VideoIndexEntry INDEX_ENTRY;
+int64_t SCANNER_TABLE_ID;
+int64_t SCANNER_COLUMN_ID;
+int64_t STRIDE = 1;
 
 bool IS_CPU;
 
@@ -218,21 +235,23 @@ void cleanup_video_codec(CodecState state) {
   //av_bitstream_filter_close(state.annexb);
 }
 
-void cpu_decoder_worker(int gpu_device_id, Queue<std::string> &video_paths,
-                        Queue<u8 *> &free_buffers,
-                        Queue<BufferHandle> &decoded_frames) {
+void ffmpeg_decoder_worker(int gpu_device_id, Queue<int64_t> &task_ids,
+                           Queue<u8 *> &free_buffers,
+                           Queue<BufferHandle> &decoded_frames) {
   double decode_time = 0;
 
   int64_t frame_size = width * height * 4 * sizeof(u8);
   int64_t frame = 0;
+  assert(IS_CPU);
   while (true) {
-    std::string path;
-    video_paths.pop(path);
+    int64_t task_id;
+    task_ids.pop(task_id);
 
-    if (path == "") {
+    if (task_id == -1) {
       break;
     }
 
+    std::string path = VIDEO_PATHS[task_id];
     printf("popped %s\n", path.c_str());
     CodecState state;
     bool success = setup_video_codec(state, path);
@@ -330,12 +349,170 @@ void cpu_decoder_worker(int gpu_device_id, Queue<std::string> &video_paths,
   TIMINGS["decode"] += decode_time;
 }
 
+void scanner_cpu_decoder_worker(int gpu_device_id,
+                                Queue<int64_t> &task_ids,
+                                Queue<u8 *> &free_buffers,
+                                Queue<BufferHandle> &decoded_frames) {
+  double decode_time = 0;
+
+  std::unique_ptr<storehouse::StorageConfig> config(
+      storehouse::StorageConfig::make_posix_config());
+  std::unique_ptr<storehouse::StorageBackend> storage(
+      storehouse::StorageBackend::make_from_config(config.get()));
+
+  scanner::internal::VideoIndexEntry index_entry =
+      scanner::internal::read_video_index(storage.get(), SCANNER_TABLE_ID,
+                                          SCANNER_COLUMN_ID, 0);
+
+  int64_t frame_size = width * height * 4 * sizeof(u8);
+  int64_t frame = 0;
+
+  std::unique_ptr<scanner::internal::DecoderAutomata> decoder(
+      new scanner::internal::DecoderAutomata(
+          scanner::CPU_DEVICE, 1,
+          scanner::internal::VideoDecoderType::SOFTWARE));
+  while (true) {
+    int64_t task_id;
+    task_ids.pop(task_id);
+
+    if (task_id == -1) {
+      break;
+    }
+
+    int64_t task_start, task_end;
+    std::tie(task_start, task_end) = TASK_RANGES.at(task_id);
+    printf("popped %ld, %ld\n", task_start, task_end);
+
+    // Read encoded video
+    std::vector<int64_t> rows;
+    for (int64_t i = task_start; i < task_end; i += STRIDE) {
+      rows.push_back(i);
+    }
+    scanner::Profiler profiler(scanner::now());
+    scanner::ElementList element_list;
+    scanner::internal::read_video_column(profiler, index_entry, rows, 0,
+                                         element_list);
+
+    // Feed decode args into decoder
+    std::vector<proto::DecodeArgs> decode_args;
+    for (Element element : element_list) {
+      decode_args.emplace_back();
+      scanner::proto::DecodeArgs &da = decode_args.back();
+      google::protobuf::io::ArrayInputStream in_stream(element.buffer,
+                                                       element.size);
+      google::protobuf::io::CodedInputStream cstream(&in_stream);
+      cstream.SetTotalBytesLimit(element.size + 1, element.size + 1);
+      bool result = da.ParseFromCodedStream(&cstream);
+      assert(result);
+      delete_element(CPU_DEVICE, element);
+    }
+    decoder->initialize(decode_args);
+
+    int64_t frame = task_start;
+    bool video_done = false;
+    while (frame < task_end) {
+      u8 *buffer;
+      free_buffers.pop(buffer);
+
+      int64_t batch = std::min((int64_t)BATCH_SIZE, (task_end - frame) / STRIDE);
+      auto decode_start = scanner::now();
+      decoder->get_frames(buffer, batch);
+      BufferHandle h;
+      h.buffer = buffer;
+      h.elements = batch;
+      decoded_frames.push(h);
+
+      frame += batch * STRIDE;
+    }
+  }
+  std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
+  TIMINGS["decode"] += decode_time;
+}
+
+void scanner_gpu_decoder_worker(int gpu_device_id,
+                                Queue<int64_t> &task_ids,
+                                Queue<u8 *> &free_buffers,
+                                Queue<BufferHandle> &decoded_frames) {
+  double decode_time = 0;
+
+  std::unique_ptr<storehouse::StorageConfig> config(
+      storehouse::StorageConfig::make_posix_config());
+  std::unique_ptr<storehouse::StorageBackend> storage(
+      storehouse::StorageBackend::make_from_config(config.get()));
+
+  scanner::internal::VideoIndexEntry index_entry =
+      scanner::internal::read_video_index(storage.get(), SCANNER_TABLE_ID,
+                                          SCANNER_COLUMN_ID, 0);
+
+  int64_t frame_size = width * height * 4 * sizeof(u8);
+  int64_t frame = 0;
+
+  std::unique_ptr<scanner::internal::DecoderAutomata> decoder(
+      new scanner::internal::DecoderAutomata(
+          scanner::DeviceHandle{DeviceType::GPU, 0}, 1,
+          scanner::internal::VideoDecoderType::NVIDIA));
+  while (true) {
+    int64_t task_id;
+    task_ids.pop(task_id);
+
+    if (task_id == -1) {
+      break;
+    }
+
+    int64_t task_start, task_end;
+    std::tie(task_start, task_end) = TASK_RANGES.at(task_id);
+    printf("popped %ld, %ld\n", task_start, task_end);
+
+    // Read encoded video
+    std::vector<int64_t> rows;
+    for (int64_t i = task_start; i < task_end; i += STRIDE) {
+      rows.push_back(i);
+    }
+    scanner::Profiler profiler(scanner::now());
+    scanner::ElementList element_list;
+    scanner::internal::read_video_column(profiler, index_entry, rows, 0,
+                                         element_list);
+
+    // Feed decode args into decoder
+    std::vector<proto::DecodeArgs> decode_args;
+    for (Element element : element_list) {
+      decode_args.emplace_back();
+      scanner::proto::DecodeArgs &da = decode_args.back();
+      google::protobuf::io::ArrayInputStream in_stream(element.buffer,
+                                                       element.size);
+      google::protobuf::io::CodedInputStream cstream(&in_stream);
+      cstream.SetTotalBytesLimit(element.size + 1, element.size + 1);
+      bool result = da.ParseFromCodedStream(&cstream);
+      assert(result);
+      delete_element(CPU_DEVICE, element);
+    }
+    decoder->initialize(decode_args);
+
+    int64_t frame = task_start;
+    bool video_done = false;
+    while (frame < task_end) {
+      u8 *buffer;
+      free_buffers.pop(buffer);
+
+      int64_t batch = std::min((int64_t)BATCH_SIZE, (task_end - frame) / STRIDE);
+      auto decode_start = scanner::now();
+      decoder->get_frames(buffer, batch);
+      BufferHandle h;
+      h.buffer = buffer;
+      h.elements = batch;
+      decoded_frames.push(h);
+
+      frame += batch * STRIDE;
+    }
+  }
+  std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
+  TIMINGS["decode"] += decode_time;
+}
 
 
-void decoder_worker(int gpu_device_id,
-                    Queue<std::string> &video_paths,
-                    Queue<u8 *> &free_buffers,
-                    Queue<BufferHandle> &decoded_frames) {
+void opencv_decoder_worker(int gpu_device_id, Queue<int64_t> &task_ids,
+                           Queue<u8 *> &free_buffers,
+                           Queue<BufferHandle> &decoded_frames) {
   double decode_time = 0;
 
   int64_t frame_size = width * height * 4 * sizeof(u8);
@@ -345,12 +522,14 @@ void decoder_worker(int gpu_device_id,
   cv::VideoCapture cap;
   cv::Ptr<cv::cudacodec::VideoReader> video;
   while (true) {
-    std::string path;
-    video_paths.pop(path);
+    int64_t task_id;
+    task_ids.pop(task_id);
 
-    if (path == "") {
+    if (task_id == -1) {
       break;
     }
+
+    std::string path = VIDEO_PATHS.at(task_id);
 
     printf("popped %s\n", path.c_str());
     if (IS_CPU) {
@@ -983,6 +1162,8 @@ void video_caffe_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
 
 int main(int argc, char** argv) {
   std::string video_list_path;
+  std::string scanner_video_args;
+  std::string db_path;
   i32 decoder_count;
   i32 eval_count;
   {
@@ -999,6 +1180,12 @@ int main(int argc, char** argv) {
         "all, stride, gather, range")(
 
         "decode_args", po::value<std::string>()->required(), "")(
+
+        "db_path", po::value<std::string>()->required(),
+        "Path to scanner db for reading preprocessed video files")(
+
+        "scanner_video_args", po::value<std::string>()->required(),
+        "Identifiers for scanner video")(
 
         "decoder_count", po::value<int>()->required(), "Number of decoders")(
 
@@ -1018,6 +1205,8 @@ int main(int argc, char** argv) {
       }
 
       video_list_path = vm["video_list_path"].as<std::string>();
+      db_path = vm["db_path"].as<std::string>();
+      scanner_video_args = vm["scanner_video_args"].as<std::string>();
 
       OPERATION = vm["operation"].as<std::string>();
       DECODE_TYPE = vm["decode_type"].as<std::string>();
@@ -1038,17 +1227,26 @@ int main(int argc, char** argv) {
     }
   }
 
+  scanner::internal::set_database_path(db_path);
+
   bool cpu_decoder = false;
+  bool scanner_decode = false;
 
   DecoderFn decoder_fn;
   WorkerFn worker_fn;
-  if (OPERATION == "decoder_cpu") {
+  if (OPERATION == "decode_cpu" || OPERATION == "stride_cpu" ||
+      OPERATION == "gather_cpu" || OPERATION == "range_cpu") {
+    BATCH_SIZE = 64;
     cpu_decoder = true;
+    scanner_decode = true;
     worker_fn = video_decode_worker;
-    output_element_size = 0;
-  } else if (OPERATION == "decoder_gpu") {
+    output_element_size = 1;
+  } else if (OPERATION == "decode_gpu" || OPERATION == "stride_gpu" ||
+             OPERATION == "gather_gpu" || OPERATION == "range_gpu") {
+    BATCH_SIZE = 64;
+    scanner_decode = true;
     worker_fn = video_decode_worker;
-    output_element_size = 0;
+    output_element_size = 1;
   } else if (OPERATION == "histogram_cpu") {
     cpu_decoder = true;
     worker_fn = video_histogram_cpu_worker;
@@ -1076,9 +1274,17 @@ int main(int argc, char** argv) {
 
   IS_CPU = cpu_decoder;
   if (IS_CPU) {
-    decoder_fn = cpu_decoder_worker;
+    if (scanner_decode) {
+      decoder_fn = scanner_cpu_decoder_worker;
+    } else {
+      decoder_fn = ffmpeg_decoder_worker;
+    }
   } else {
-    decoder_fn = decoder_worker;
+    if (scanner_decode) {
+      decoder_fn = scanner_gpu_decoder_worker;
+    } else {
+      decoder_fn = opencv_decoder_worker;
+    }
   }
 
   // Setup decoder
@@ -1135,9 +1341,106 @@ int main(int argc, char** argv) {
   std::thread save_thread(save_worker, 0, std::ref(save_buffers),
                           std::ref(free_output_buffers));
 
+  std::unique_ptr<storehouse::StorageConfig> config(
+      storehouse::StorageConfig::make_posix_config());
+  std::unique_ptr<storehouse::StorageBackend> storage(
+      storehouse::StorageBackend::make_from_config(config.get()));
+
   // Insert video paths into work queue
-  Queue<std::string> video_paths(10000);
-  {
+  int64_t tid = 0;
+  Queue<int64_t> task_ids(10000);
+  if (scanner_decode) {
+    scanner::proto::MemoryPoolConfig config;
+    config.set_pinned_cpu(false);
+    config.mutable_cpu()->set_use_pool(false);
+    config.mutable_gpu()->set_use_pool(false);
+    init_memory_allocators(config, {0});
+
+    // Read index entry
+
+    SCANNER_TABLE_ID = -1;
+    SCANNER_COLUMN_ID = -1;
+    {
+      std::vector<std::string> ids = split(scanner_video_args, ':');
+      SCANNER_TABLE_ID = atoi(ids[0].c_str());
+      SCANNER_COLUMN_ID = atoi(ids[1].c_str());
+    }
+
+    scanner::internal::VideoIndexEntry index_entry = scanner::internal::read_video_index(
+        storage.get(), SCANNER_TABLE_ID, SCANNER_COLUMN_ID, 0);
+
+    printf("decode type %s\n", DECODE_TYPE.c_str());
+    // Break up work into keyframe sized chunks
+    auto& keyframes = index_entry.keyframe_positions;
+    if (DECODE_TYPE == "all") {
+      for (int i = 1; i < keyframes.size(); ++i) {
+        int64_t start = keyframes[i - 1];
+        int64_t end = keyframes[i];
+        TASK_RANGES.push_back(std::make_tuple(start, end));
+      }
+    } else if (DECODE_TYPE == "strided") {
+      int64_t total_frames = keyframes.back();
+      STRIDE = atoi(DECODE_ARGS.c_str());
+      int64_t current_frame = STRIDE;
+      int keyframe_idx = 1;
+      int start_frame = 0;
+      while (current_frame < total_frames) {
+        if (current_frame + STRIDE >= keyframes[keyframe_idx]) {
+          // Insert current keyframe block
+          TASK_RANGES.push_back(std::make_tuple(start_frame, current_frame));
+          printf("range %ld, %ld\n", start_frame, current_frame);
+          start_frame = current_frame;
+          // Search for next keyframe start
+          int64_t next_frame =
+              std::min(current_frame + STRIDE, keyframes.back() - 1);
+          for (int i = keyframe_idx; i < keyframes.size(); ++i) {
+            if (next_frame < keyframes[i]) {
+              keyframe_idx = i;
+              break;
+            }
+          }
+        }
+        current_frame += STRIDE;
+      }
+    } else if (DECODE_TYPE == "range") {
+      std::vector<int64_t> range_start;
+      std::vector<int64_t> range_end;
+      for (auto s : split(DECODE_ARGS, ',')) {
+        std::vector<std::string> se = split(s, ':');
+        range_start.push_back(atoi(se[0].c_str()));
+        range_end.push_back(atoi(se[1].c_str()));
+      }
+
+      for (int ri = 0; ri < range_start.size(); ++ri) {
+        int64_t rs = range_start[ri];
+        int64_t re = range_end[ri];
+        int64_t start = 0;
+        int64_t end = keyframes[0];
+        int i = 0;
+        for (; i < keyframes.size(); ++i) {
+          if (keyframes[i] > rs) {
+            break;
+          }
+          start = keyframes[i];
+        }
+        // Start inserting tasks
+        for (; i < keyframes.size(); ++i) {
+          if (keyframes[i] >= re) {
+            break;
+          }
+          TASK_RANGES.push_back(std::make_tuple(start, keyframes[i]));
+          start = keyframes[i];
+        }
+        TASK_RANGES.push_back(std::make_tuple(start, re));
+      }
+    }
+    for (size_t i = 0; i < TASK_RANGES.size(); ++i) {
+      auto& kv = TASK_RANGES[i];
+      //printf("s/e: %d-%d\n", std::get<0>(kv), std::get<1>(kv));
+      task_ids.push(i);
+    }
+
+  } else {
     std::ifstream infile(video_list_path);
     std::string line;
     while (std::getline(infile, line)) {
@@ -1145,9 +1448,11 @@ int main(int argc, char** argv) {
         break;
       }
       std::cout << line << std::endl;
-      video_paths.push(line);
+      VIDEO_PATHS.push_back(line);
+      task_ids.push(tid++);
     }
   }
+
 
   // Wait to make sure everything is setup first
   sleep(5);
@@ -1155,14 +1460,14 @@ int main(int argc, char** argv) {
   // Start work by setting up feeder
   std::vector<std::thread> decoder_threads;
   for (i32 i = 0; i < decoder_count; ++i) {
-    decoder_threads.emplace_back(decoder_fn, 0, std::ref(video_paths),
+    decoder_threads.emplace_back(decoder_fn, 0, std::ref(task_ids),
                                  std::ref(free_buffers),
                                  std::ref(decoded_frames));
   }
   auto total_start = scanner::now();
 
   for (i32 i = 0; i < decoder_count; ++i) {
-    video_paths.push("");
+    task_ids.push(-1);
   }
   for (i32 i = 0; i < decoder_count; ++i) {
     decoder_threads[i].join();

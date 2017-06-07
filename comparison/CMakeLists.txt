@@ -26,6 +26,8 @@ find_package(TinyToml REQUIRED)
 find_package(GFlags REQUIRED)
 find_package(Glog REQUIRED)
 find_package(FFmpeg REQUIRED)
+find_package(Storehouse REQUIRED CONFIG
+  PATHS "${SCANNER_ROOT_DIR}/thirdparty/build/bin/storehouse")
 
 find_package(Halide REQUIRED)
 include(${CMAKE_SOURCE_DIR}/cmake/Util/HalideGenerator.cmake)
@@ -61,7 +63,8 @@ set(LIBRARIES
   ${CUDA_LIBRARIES}
   ${PROTOBUF_LIBRARY}
   ${GFLAGS_LIBRARIES}
-  ${GLOG_LIBRARIES})
+  ${GLOG_LIBRARIES}
+  ${STOREHOUSE_LIBRARIES})
 
 set(HALIDE_TARGETS)
 macro(add_halide_target SRC TARGET)

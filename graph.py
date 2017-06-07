@@ -405,6 +405,8 @@ def standalone_graphs(frame_counts, results):
 
 def comparison_graphs(name,
                       video,
+                      ops,
+                      labels,
                       standalone_results, scanner_results,
                       peak_results,
                       labels_on=True):
@@ -445,13 +447,6 @@ def comparison_graphs(name,
     #           'DNN',
     #           'GATHERCPU',
     #           'GATHERGPU']
-    ops = ['histogram_cpu', 'histogram_gpu',
-           'flow_cpu', 'flow_gpu',
-           'caffe']
-    labels = ['HISTCPU', 'HISTGPU',
-              'FLOWCPU', 'FLOWGPU',
-              'DNN']
-
     #for test_name, tests in results.iteritems():
     if 1:
         ys = []
@@ -463,7 +458,8 @@ def comparison_graphs(name,
         standalone_y = []
         scanner_y = []
         peak_y = []
-        for label in ops:
+        #multi_y = []
+        for i, label in enumerate(ops):
             v = peak_results[label][0]
             frames = v['frames']
             peak_sec, timings = v['results']
@@ -496,6 +492,10 @@ def comparison_graphs(name,
                 scanner_y.append(sc_fps / p_fps)
                 scanner_fps.append(sc_fps)
 
+            #multi_y.append(multi_fps[i]/ p_fps)
+            print(p_fps)
+            #print(multi_fps[i]/p_fps)
+
         fps = []
         fps.append(standalone_fps)
         fps.append(scanner_fps)
@@ -503,13 +503,14 @@ def comparison_graphs(name,
 
         ys.append(standalone_y)
         ys.append(scanner_y)
+        #ys.append(multi_y)
         print(ys)
 
         x = np.arange(len(ops)) * 1.4
 
         variants = ['Baseline', 'Scanner']
 
-        colors = [NAIVE_COLOR, SCANNER_COLOR]
+        colors = [NAIVE_COLOR, SCANNER_COLOR, PEAK_COLOR]
         for (i, y) in enumerate(ys):
             xx = x+(i*0.35)
             ax.bar(xx, y, 0.3, align='center', color=colors[i],
@@ -517,7 +518,7 @@ def comparison_graphs(name,
             if i == 1:
                 for k, xxx in enumerate(xx):
                     ax.annotate("{}".format(labels[k]),
-                                xy=(xxx, -0.08), annotation_clip=False,
+                                xy=(xxx, -0.08 * 1), annotation_clip=False,
                                 ha='center')
             if i == 1:
                 for k, xy in enumerate(zip(xx, y)):
@@ -534,9 +535,11 @@ def comparison_graphs(name,
         ax.set_xticklabels(['', '', ''])
         ax.xaxis.grid(False)
 
-        yt = [0, 0.5, 1]
+        #yt = [0, 1, 2, 3, 4]
+        yt = [0.25, 0.5, 0.75, 1.0]
         ax.set_yticks(yt)
         ax.set_yticklabels(['{:.1f}'.format(d) for d in yt])
+        #ax.set_ylim([0, 4.1])
         ax.set_ylim([0, 1.1])
 
 
@@ -633,8 +636,8 @@ def multi_gpu_comparison_graphs(name, gpus, results,
         plt.ylabel("Throughput (Relative to 1 GPU)")
     ax.xaxis.grid(False)
 
-    ops = ['histogram_gpu', 'caffe', 'flow_gpu']
-    labels = ['HIST', 'DNN', 'FLOW']
+    ops = ['histogram_gpu', 'caffe', 'flow_gpu', 'gather_hist_gpu']
+    labels = ['HIST', 'DNN', 'FLOW', 'GATHER']
     num_gpus = gpus
 
     x = np.arange(len(labels)) * 1.2

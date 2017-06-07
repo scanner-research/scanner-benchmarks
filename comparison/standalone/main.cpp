@@ -58,6 +58,27 @@ int GPUS_PER_NODE = 1;           // GPUs to use per node
 
 std::map<std::string, double> TIMINGS;
 
+std::string DECODE_TYPE;
+std::string DECODE_ARGS;
+
+// util
+template<typename Out>
+void split(const std::string &s, char delim, Out result) {
+  std::stringstream ss;
+  ss.str(s);
+  std::string item;
+  while (std::getline(ss, item, delim)) {
+    *(result++) = item;
+  }
+}
+
+std::vector<std::string> split(const std::string &s, char delim) {
+  std::vector<std::string> elems;
+  split(s, delim, std::back_inserter(elems));
+  return elems;
+}
+
+
 std::string meta_path(std::string path) {
   return path + "/meta.txt";
 }
@@ -118,6 +139,77 @@ void video_decode_cpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
   TIMINGS["load"] = load_time;
 }
 
+void video_decode_range_cpu_worker(int gpu_device_id,
+                                   Queue<int64_t> &work_items) {
+  double setup_time = 0;
+  double load_time = 0;
+
+  std::vector<int64_t> range_start;
+  std::vector<int64_t> range_end;
+  for (auto s : split(DECODE_ARGS, ',')) {
+    std::vector<std::string> se = split(s, ':');
+    range_start.push_back(atoi(se[0].c_str()));
+    range_end.push_back(atoi(se[1].c_str()));
+  }
+
+  cv::VideoCapture video;
+  while (true) {
+    int64_t work_item_index;
+    work_items.pop(work_item_index);
+
+    if (work_item_index == -1) {
+      break;
+    }
+
+    const std::string& path = PATHS[work_item_index];
+
+    auto setup_start = scanner::now();
+    video.open(path);
+    int width = (int64_t)video.get(CV_CAP_PROP_FRAME_WIDTH);
+    int height = (int64_t)video.get(CV_CAP_PROP_FRAME_HEIGHT);
+    assert(width != 0 && height != 0);
+    setup_time += scanner::nano_since(setup_start);
+
+    auto start_time = scanner::now();
+    video.open(path);
+    bool done = false;
+    int64_t frame = 0;
+    cv::Mat image(height, width, CV_8UC3);
+
+    int64_t ri = 0;
+    int64_t start_frame = range_start[ri];
+    video.set(CV_CAP_PROP_POS_FRAMES, start_frame);
+    int64_t next_skip_frame = range_end[ri];
+    while (ri < range_start.size()) {
+      auto load_start = scanner::now();
+      bool valid_frame = video.read(image);
+      load_time += scanner::nano_since(load_start);
+      if (!valid_frame) {
+        done = true;
+      }
+      if (image.data == nullptr) {
+        break;
+      }
+      // Stride
+      frame++;
+      if (frame == next_skip_frame) {
+        ri++;
+        if (ri < range_start.size()) {
+          video.set(CV_CAP_PROP_POS_FRAMES, range_start[ri]);
+          next_skip_frame = range_end[ri];
+          frame = range_start[ri];
+        }
+      }
+    }
+    printf("frame count %d\n", frame);
+    assert(ri == range_start.size());
+    TIMINGS["total"] += scanner::nano_since(start_time);
+  }
+  TIMINGS["setup"] = setup_time;
+  TIMINGS["load"] = load_time;
+}
+
+
 void video_decode_gpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
   double setup_time = 0;
   double load_time = 0;
@@ -156,6 +248,7 @@ void video_decode_gpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
       if (image.data == nullptr) {
         break;
       }
+      frame++;
       // Stride
       for (int i = 0; i < STRIDE - 1 && valid_frame; ++i) {
         valid_frame = video->nextFrame(image);
@@ -169,6 +262,77 @@ void video_decode_gpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
   TIMINGS["setup"] = setup_time;
   TIMINGS["load"] = load_time;
 }
+
+void video_decode_range_gpu_worker(int gpu_device_id,
+                                   Queue<int64_t> &work_items) {
+  double setup_time = 0;
+  double load_time = 0;
+
+  std::vector<int64_t> range_start;
+  std::vector<int64_t> range_end;
+  for (auto s : split(DECODE_ARGS, ',')) {
+    std::vector<std::string> se = split(s, ':');
+    range_start.push_back(atoi(se[0].c_str()));
+    range_end.push_back(atoi(se[1].c_str()));
+  }
+
+  cv::cuda::setDevice(gpu_device_id);
+  cv::Ptr<cv::cudacodec::VideoReader> video;
+  while (true) {
+    int64_t work_item_index;
+    work_items.pop(work_item_index);
+
+    if (work_item_index == -1) {
+      break;
+    }
+
+    const std::string& path = PATHS[work_item_index];
+
+    auto setup_start = scanner::now();
+    video = cv::cudacodec::createVideoReader(path);
+    int width = video->format().width;
+    int height = video->format().height;
+    assert(width != 0 && height != 0);
+    setup_time += scanner::nano_since(setup_start);
+
+    auto start_time = scanner::now();
+    video = cv::cudacodec::createVideoReader(path);
+    bool done = false;
+    int64_t frame = 0;
+    cvc::GpuMat image(height, width, CV_8UC3);
+
+    int64_t ri = 0;
+    int64_t next_skip_frame = range_end[ri];
+    while (ri < range_start.size()) {
+      auto load_start = scanner::now();
+      bool valid_frame = video->nextFrame(image);
+      load_time += scanner::nano_since(load_start);
+      if (!valid_frame) {
+        done = true;
+      }
+      if (image.data == nullptr) {
+        break;
+      }
+      frame++;
+      if (frame == next_skip_frame) {
+        ri++;
+        if (ri < range_start.size()) {
+          for (int64_t r = frame; r < range_start[ri]; ++r) {
+            valid_frame = video->nextFrame(image);
+          }
+          frame = range_start[ri];
+          next_skip_frame = range_end[ri];
+        }
+      }
+    }
+    printf("frame count %d\n", frame);
+    assert(ri == range_start.size());
+    TIMINGS["total"] += scanner::nano_since(start_time);
+  }
+  TIMINGS["setup"] = setup_time;
+  TIMINGS["load"] = load_time;
+}
+
 
 void video_histogram_cpu_worker(int gpu_device_id, Queue<int64_t> &work_items) {
   double setup_time = 0;
@@ -421,10 +585,7 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
 
       auto eval_start = scanner::now();
       cv::cvtColor(inputs[curr_idx], gray[curr_idx], CV_BGR2GRAY);
-      //flow->calc(gray[prev_idx], gray[curr_idx], output_flow);
-      calcOpticalFlowFarneback(gray[prev_idx], gray[curr_idx],
-                               output_flow,
-                               0.5, 3, 15, 3, 5, 1.2, 0);
+      flow->calc(gray[prev_idx], gray[curr_idx], output_flow);
 
       eval_time += scanner::nano_since(eval_start);
 
@@ -450,7 +611,8 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
   cv::cuda::setDevice(gpu_device_id);
 
   cv::Ptr<cv::cudacodec::VideoReader> video;
-  cv::Ptr<cvc::DenseOpticalFlow> flow = cvc::FarnebackOpticalFlow::create();
+  cv::Ptr<cvc::DenseOpticalFlow> flow = 
+          cvc::FarnebackOpticalFlow::create(3, 0.5, false, 15, 3, 5, 1.2, 0);
   while (true) {
     int64_t work_item_index;
     work_items.pop(work_item_index);
@@ -688,11 +850,14 @@ int main(int argc, char** argv) {
         "operation", po::value<std::string>()->required(),
         "decode, histogram, flow, or caffe")(
 
-        "frames", po::value<int>()->required(),
-        "Total number of frames")(
+        "decode_type", po::value<std::string>()->required(),
+        "all, stride, gather, range")(
 
-        "stride", po::value<int>()->required(),
-        "Stride")(
+        "decode_args", po::value<std::string>()->required(), "")(
+
+        "frames", po::value<int>()->required(), "Total number of frames")(
+
+        "stride", po::value<int>()->required(), "Stride")(
 
         "gpus_per_node", po::value<int>(), "GPUs to use per node");
     try {
@@ -707,6 +872,8 @@ int main(int argc, char** argv) {
       paths_file = vm["paths_file"].as<std::string>();
 
       operation = vm["operation"].as<std::string>();
+      DECODE_TYPE = vm["decode_type"].as<std::string>();
+      DECODE_ARGS = vm["decode_args"].as<std::string>();
 
       FRAMES = vm["frames"].as<int>();
 
@@ -724,10 +891,16 @@ int main(int argc, char** argv) {
             << ", operation " << operation << std::endl;
 
   WorkerFn worker_fn;
-  if (operation == "decode_cpu") {
+  if (operation == "decode_cpu" || operation == "stride_cpu" ||
+      operation == "gather_cpu") {
     worker_fn = video_decode_cpu_worker;
-  } else if (operation == "decode_gpu") {
+  } else if (operation == "decode_gpu" || operation == "stride_gpu" ||
+             operation == "gather_gpu") {
     worker_fn = video_decode_gpu_worker;
+  } else if (operation == "range_cpu") {
+    worker_fn = video_decode_range_cpu_worker;
+  } else if (operation == "range_gpu") {
+    worker_fn = video_decode_range_gpu_worker;
   } else if (operation == "histogram_cpu") {
     worker_fn = video_histogram_cpu_worker;
   } else if (operation == "histogram_gpu") {
