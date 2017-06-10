@@ -937,7 +937,7 @@ def scanner_benchmark(video, tests):
 
     def hist_pipeline(device):
         def fn(frame):
-            return db.ops.Histogram(frame=frame, device=device)
+            return db.ops.Histogram(frame=frame, batch=128, device=device)
         return fn
 
     hist_cpu = hist_pipeline(device=DeviceType.CPU)
@@ -2017,10 +2017,10 @@ def data_loading_benchmarks():
          'scanner_settings': {
              'task_size': 2048,
              'cpu_pool': '32G',
-             'pipeline_instances_per_node': 32
+             'pipeline_instances_per_node': 16
          },
          'peak_settings': {
-             'decoders': 32,
+             'decoders': 16,
              'evaluators': 1,
              'tt': '',
              'seg': '5',
@@ -2043,10 +2043,10 @@ def data_loading_benchmarks():
          'scanner_settings': {
              'task_size': 512,
              'cpu_pool': '32G',
-             'pipeline_instances_per_node': 32
+             'pipeline_instances_per_node': 16
          },
          'peak_settings': {
-             'decoders': 32,
+             'decoders': 16,
              'evaluators': 1,
              'tt': '',
              'seg': '5',
@@ -2068,11 +2068,11 @@ def data_loading_benchmarks():
          'sampling': 'strided_long',
          'scanner_settings': {
              'cpu_pool': '32G',
-             'task_size': 13,
-             'pipeline_instances_per_node': 32
+             'task_size': 1,
+             'pipeline_instances_per_node': 16
          },
          'peak_settings': {
-             'decoders': 32,
+             'decoders': 16,
              'evaluators': 1,
              'tt': '',
              'seg': '5',
@@ -2080,8 +2080,8 @@ def data_loading_benchmarks():
         {'name': 'gather_gpu',
          'sampling': 'strided_long',
          'scanner_settings': {
-             'task_size': 12,
              'gpu_pool': '4G',
+             'task_size': 1,
              'pipeline_instances_per_node': 1
          },
          'peak_settings': {
@@ -2093,12 +2093,12 @@ def data_loading_benchmarks():
         {'name': 'range_cpu',
          'sampling': 'range',
          'scanner_settings': {
-             'task_size': 128,
+             'task_size': 1024,
              'cpu_pool': '32G',
-             'pipeline_instances_per_node': 32
+             'pipeline_instances_per_node': 16
          },
          'peak_settings': {
-             'decoders': 32,
+             'decoders': 16,
              'evaluators': 1,
              'tt': '',
              'seg': '5',
