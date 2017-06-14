@@ -14,9 +14,12 @@ if __name__ == '__main__':
                          help='Which benchmark to run')
     bench_p.add_argument('output_directory', type=str,
                          help='Where to output results')
+    bench_p.add_argument('--debug', action='store_true',
+                         help='Enable DB caching while debugging tests')
     bench_p.set_defaults(func=bench_main,
                          test='all',
                          output_directory='benchmark_results')
+
     # Graphs
     graphs_p = subp.add_parser('graphs', help='Generate graphs from bench')
     graphs_p.set_defaults(func=graph_main)

@@ -32,7 +32,7 @@ COMPARISON_DIR = os.path.join(SCRIPT_DIR, 'comparison')
 DEVNULL = open(os.devnull, 'wb', 0)
 
 DB_PATH = '/tmp/scanner_db'
-
+DEBUG = False
 
 def clear_filesystem_cache():
     os.system('sudo sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"')
@@ -60,12 +60,24 @@ def run_trial(db, jobs, opts={}):
     add_opt('gpu_pool')
     add_opt('pipeline_instances_per_node')
 
+    force_cpu_decode = \
+      opts['force_cpu_decode'] if 'force_cpu_decode' in opts else False
+    no_pipelining = \
+      opts['no_pipelining'] if 'no_pipelining' in opts else False
     start = now()
     success = True
     prof = None
     try:
         clear_filesystem_cache()
+        if force_cpu_decode:
+            os.environ['FORCE_CPU_DECODE'] = ''
+        if no_pipelining:
+            os.environ['NO_PIPELINING'] = ''
         out_table = db.run(jobs, force=True, **scanner_opts)
+        if force_cpu_decode:
+            del os.environ['FORCE_CPU_DECODE']
+        if no_pipelining:
+            del os.environ['NO_PIPELINING']
         prof = out_table.profiler()
         elapsed = now() - start
         total = prof.total_time_interval()
@@ -202,74 +214,89 @@ def get_trial_total_io_read(result):
     return total_io
 
 def cpm_ablation_benchmark():
-    input_video = '/home/will/data/meanGirls_medium.mp4'
+    input_video = '/home/will/data/excalibur_1981.mp4'
     with Database() as db:
         if not db.has_table(input_video):
             db.ingest_videos([(input_video, input_video)])
 
         descriptor = NetDescriptor.from_file(db, 'nets/cpm2.toml')
         cpm2_args = db.protobufs.CPM2Args()
-        cpm2_args.scale = 368.0/720.0
+        cpm2_args.scale = 368.0/1080.0
         caffe_args = cpm2_args.caffe_args
         caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
 
-        def run(k, gpu_pool=None, cpu_pool=None, batch_size=1, tasks_in_queue_per_pu=1, pipelines=1):
-            frame = db.table(input_video).as_op().range(0, 2000, task_size = 50)
-            frame_info = db.ops.InfoFromFrame(frame = frame)
-            caffe_args.batch_size = 1
-            cpm2_input = db.ops.CPM2Input(
-                frame = frame,
-                args = cpm2_args,
-                device = DeviceType.GPU,
-                batch = batch_size)
-            cpm2_resized_map, cpm2_joints = db.ops.CPM2(
-                cpm2_input = cpm2_input,
-                args = cpm2_args,
-                device = DeviceType.GPU,
-                batch = batch_size)
-            poses = db.ops.CPM2Output(
-                cpm2_resized_map = cpm2_resized_map,
-                cpm2_joints = cpm2_joints,
-                original_frame_info = frame_info,
-                args = cpm2_args,
-                batch = batch_size)
-            job = Job(columns = [poses], name = 'example_poses')
-            start = now()
-            clear_filesystem_cache()
-            output = db.run(job,
-                            force=True,
-                            pipeline_instances_per_node=pipelines,
-                            cpu_pool=cpu_pool,
-                            gpu_pool=gpu_pool,
-                            tasks_in_queue_per_pu=tasks_in_queue_per_pu,
-                            profiling=True)
-            prof = output.profiler()
-            elapsed = now() - start
-            total = prof.total_time_interval()
-            t = (total[1] - total[0])
-            t /= float(1e9)  # ns to s
-            prof.write_trace('{}.trace'.format(k))
-            return t
+        def run(pipeline, k, opts):
+            task_size = opts['task_size']
+            batch_size = opts['work_item_size']
+            input_op = db.table(input_video).as_op()
+            def histogram():
+                frame = input_op.range(0, 40000, task_size = task_size*10)
+                histogram = db.ops.Histogram(frame=frame, device=DeviceType.GPU)
+                return histogram
 
-        options = {
-            # 'tasks_in_queue_per_pu': 4,
-            # 'batch_size': 50,
-            # 'pipelines': 4,
-            # 'gpu_pool': '4G'
-        }
-        values = [
-            ('pipelines', 4),
-            ('tasks_in_queue_per_pu', 4),
-            ('batch_size', 50),
-            ('gpu_pool', '4G'),
-            ('cpu_pool', 'p90G')]
-        timings = [('baseline', run('baseline'))]
-        # timings = []
-        for (k, v) in values:
-            options[k] = v
-            t = run(k, **options)
-            timings.append((k, t))
+            def flow_gpu():
+                frame = input_op.range(0, 4000, task_size = task_size)
+                flow = db.ops.OpticalFlow(frame=frame, batch=batch_size, device=DeviceType.GPU)
+                return db.ops.DiscardFrame(ignore=flow, device=DeviceType.GPU)
+
+            def cpm():
+                frame = input_op.range(0, 1000, task_size = task_size / 4)
+                frame_info = db.ops.InfoFromFrame(frame = frame)
+                caffe_args.batch_size = 1
+                cpm2_input = db.ops.CPM2Input(
+                    frame = frame,
+                    args = cpm2_args,
+                    device = DeviceType.GPU,
+                    batch = batch_size)
+                cpm2_resized_map, cpm2_joints = db.ops.CPM2(
+                    cpm2_input = cpm2_input,
+                    args = cpm2_args,
+                    device = DeviceType.GPU,
+                    batch = batch_size)
+                return db.ops.CPM2Output(
+                    cpm2_resized_map = cpm2_resized_map,
+                    cpm2_joints = cpm2_joints,
+                    original_frame_info = frame_info,
+                    args = cpm2_args,
+                    batch = batch_size)
+
+            pipelines = {
+                'histogram': histogram,
+                'flow_gpu': flow_gpu,
+                'cpm': cpm
+            }
+
+            job = Job(columns = [pipelines[pipeline]()], name = 'example_poses')
+            success, total, prof = run_trial(db, job, opts)
+            prof.write_trace('{}.trace'.format(k))
+            return total
+
+        timings = {}
+        for pipeline in ['cpm', 'histogram', 'flow_gpu']:
+            options = {
+                'pipeline_instances_per_node': 1,
+                'no_pipelining': True,
+                'work_item_size': 1,
+                'task_size': 10000,
+                'force_cpu_decode': True,
+            }
+            values = [
+                ('pipeline_instances_per_node', 4),
+                ('no_pipelining', False),
+                ('force_cpu_decode', False),
+                ('task_size', 200),
+                ('work_item_size', 8)]
+
+            timings[pipeline] = \
+              [('baseline', run(pipeline, 'baseline', options))]
             pprint(timings)
+            options['task_size'] = 20
+
+            for (k, v) in values:
+                options[k] = v
+                t = run(pipeline, k, options)
+                timings[pipeline].append((k, t))
+                pprint(timings)
 
 
 # TODO: re-encode video from stride
@@ -2247,6 +2274,8 @@ BENCHMARKS = {
 }
 
 def bench_main(args):
+    global DEBUG
+    DEBUG = args.debug
     test = args.test
     out_dir = args.output_directory
     assert test in BENCHMARKS
