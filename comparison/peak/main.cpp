@@ -884,7 +884,6 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
     SaveHandle save_handle;
     free_output_buffers.pop(save_handle);
     save_handle.elements = elements;
-    save_handle.stream = Stream::Null();
 
     u8* output_buffer = save_handle.buffer;
 
@@ -979,7 +978,8 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
                                   output_buffer + i * output_element_size);
 
       auto eval_start = scanner::now();
-      flow->calc(gray[prev_idx], gray[curr_idx], output_flow_gpu, stream);
+      flow->calc(gray[prev_idx], gray[curr_idx], output_flow_gpu,
+                 save_handle.stream);
       eval_time += scanner::nano_since(eval_start);
     }
 
