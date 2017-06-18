@@ -8,6 +8,7 @@ if(CUDA_FOUND AND OpenCV_FOUND)
     main.cpp
     peak_cpu_video_decoder.cpp
     peak_gpu_video_decoder.cpp
+    ${SCANNER_ROOT_DIR}/scanner/util/halide_context.cpp
     $<TARGET_OBJECTS:util>)
 
   target_link_libraries(peak_comparison PRIVATE
@@ -20,7 +21,4 @@ if(CUDA_FOUND AND OpenCV_FOUND)
   foreach(TARGET ${HALIDE_TARGETS})
     halide_add_aot_library_dependency(peak_comparison ${TARGET})
   endforeach()
-  target_link_libraries(peak_comparison PRIVATE
-    -L${SCANNER_ROOT_DIR}/build/
-    scanner_halide)
 endif()

@@ -102,7 +102,6 @@ using WorkerFn = std::function<void(int, Queue<u8 *> &, Queue<BufferHandle> &,
 const int NUM_BUFFERS = 3;
 int BATCH_SIZE = 128;      // Batch size for network
 const int NET_BATCH_SIZE = 128;      // Batch size for network
-const int FLOW_WORK_REDUCTION = 20;
 const int BINS = 16;
 const std::string NET_PATH = "nets/googlenet.toml";
 
@@ -259,6 +258,7 @@ void ffmpeg_decoder_worker(int gpu_device_id, Queue<int64_t> &task_ids,
 
     int64_t frame = 0;
     bool video_done = false;
+    bool to_receive = false;
     while (!video_done) {
       u8 *buffer;
       free_buffers.pop(buffer);
@@ -266,34 +266,40 @@ void ffmpeg_decoder_worker(int gpu_device_id, Queue<int64_t> &task_ids,
       int64_t buffer_frame = 0;
       while (buffer_frame < BATCH_SIZE) {
         auto decode_start = scanner::now();
-        int error = av_read_frame(state.format_context, &state.packet);
-        if (error == AVERROR_EOF) {
-          video_done = true;
-          break;
-        }
-        if (state.packet.stream_index != state.video_stream_index) {
-          av_packet_unref(&state.packet);
-          continue;
-        }
-
-        error = avcodec_send_packet(state.cc, &state.packet);
-        if (error != AVERROR_EOF) {
-          if (error < 0) {
-            char err_msg[256];
-            av_strerror(error, err_msg, 256);
-            fprintf(stderr, "Error while sending packet (%d): %s\n", error,
-                    err_msg);
-            LOG(FATAL) << "Error while sending packet";
+        int error;
+        if (!to_receive) {
+          error = av_read_frame(state.format_context, &state.packet);
+          if (error == AVERROR_EOF) {
+            printf("EOF!\n");
+            video_done = true;
+            break;
           }
+          if (state.packet.stream_index != state.video_stream_index) {
+            av_packet_unref(&state.packet);
+            continue;
+          }
+
+          error = avcodec_send_packet(state.cc, &state.packet);
+          if (error != AVERROR_EOF) {
+            if (error < 0) {
+              char err_msg[256];
+              av_strerror(error, err_msg, 256);
+              fprintf(stderr, "Error while sending packet (%d): %s\n", error,
+                      err_msg);
+              LOG(FATAL) << "Error while sending packet";
+            }
+          }
+          av_packet_unref(&state.packet);
         }
-        av_packet_unref(&state.packet);
         while (buffer_frame < BATCH_SIZE) {
           error = avcodec_receive_frame(state.cc, state.frame);
           if (error == AVERROR_EOF) {
+            to_receive = false;
             av_frame_unref(state.frame);
             break;
           }
           if (error == 0) {
+            to_receive = true;
             u8* scale_buffer = buffer + buffer_frame * frame_size;
 
             uint8_t *out_slices[4];
@@ -326,6 +332,7 @@ void ffmpeg_decoder_worker(int gpu_device_id, Queue<int64_t> &task_ids,
             buffer_frame++;
             continue;
           } else if (error == AVERROR(EAGAIN)) {
+            to_receive = false;
             break;
           } else {
             char err_msg[256];
@@ -367,10 +374,12 @@ void scanner_cpu_decoder_worker(int gpu_device_id,
   int64_t frame_size = width * height * 4 * sizeof(u8);
   int64_t frame = 0;
 
+  scanner::Profiler profiler(scanner::now());
   std::unique_ptr<scanner::internal::DecoderAutomata> decoder(
       new scanner::internal::DecoderAutomata(
           scanner::CPU_DEVICE, 1,
           scanner::internal::VideoDecoderType::SOFTWARE));
+  decoder->set_profiler(&profiler);
   while (true) {
     int64_t task_id;
     task_ids.pop(task_id);
@@ -381,14 +390,12 @@ void scanner_cpu_decoder_worker(int gpu_device_id,
 
     int64_t task_start, task_end;
     std::tie(task_start, task_end) = TASK_RANGES.at(task_id);
-    printf("popped %ld, %ld\n", task_start, task_end);
 
     // Read encoded video
     std::vector<int64_t> rows;
     for (int64_t i = task_start; i < task_end; i += STRIDE) {
       rows.push_back(i);
     }
-    scanner::Profiler profiler(scanner::now());
     scanner::ElementList element_list;
     scanner::internal::read_video_column(profiler, index_entry, rows, 0,
                                          element_list);
@@ -427,6 +434,12 @@ void scanner_cpu_decoder_worker(int gpu_device_id,
   }
   std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
   TIMINGS["decode"] += decode_time;
+  TIMINGS["frames_fed"] +=
+      profiler.get_counters().at("frames_fed") * 1000000000.0;
+  TIMINGS["frames_used"] +=
+      profiler.get_counters().at("frames_used") * 1000000000.0;
+  TIMINGS["frames_decoded"] +=
+      profiler.get_counters().at("frames_decoded") * 1000000000.0;
 }
 
 void scanner_gpu_decoder_worker(int gpu_device_id,
@@ -447,10 +460,12 @@ void scanner_gpu_decoder_worker(int gpu_device_id,
   int64_t frame_size = width * height * 4 * sizeof(u8);
   int64_t frame = 0;
 
+  scanner::Profiler profiler(scanner::now());
   std::unique_ptr<scanner::internal::DecoderAutomata> decoder(
       new scanner::internal::DecoderAutomata(
           scanner::DeviceHandle{DeviceType::GPU, 0}, 1,
           scanner::internal::VideoDecoderType::NVIDIA));
+  decoder->set_profiler(&profiler);
   while (true) {
     int64_t task_id;
     task_ids.pop(task_id);
@@ -507,6 +522,12 @@ void scanner_gpu_decoder_worker(int gpu_device_id,
   }
   std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
   TIMINGS["decode"] += decode_time;
+  TIMINGS["frames_fed"] +=
+      profiler.get_counters().at("frames_fed") * 1000000000.0;
+  TIMINGS["frames_used"] +=
+      profiler.get_counters().at("frames_used") * 1000000000.0;
+  TIMINGS["frames_decoded"] +=
+      profiler.get_counters().at("frames_decoded") * 1000000000.0;
 }
 
 
@@ -740,7 +761,6 @@ void video_histogram_cpu_worker(int gpu_device_id,
     save_handle.elements = elements;
 
     for (int i = 0; i < elements; ++i) {
-      cv::Mat out(1, BINS * 3, CV_32S, output_buffer + i * output_element_size);
       cv::Mat image(height, width, CV_8UC3, buffer + i * frame_size);
       auto histo_start = scanner::now();
       float range[] = {0, 256};
@@ -748,7 +768,7 @@ void video_histogram_cpu_worker(int gpu_device_id,
       u8* output_buf = output_buffer + i * output_element_size;
       for (i32 j = 0; j < 3; ++j) {
         int channels[] = {j};
-        cv::Mat out(BINS, 1, CV_32S, output_buf + BINS * sizeof(int));
+        cv::Mat out(BINS, 1, CV_32S, output_buf + j * BINS * sizeof(int));
         cv::calcHist(&image, 1, channels, cv::Mat(),
                      out,
                      1, &BINS,
@@ -851,6 +871,7 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
 
   bool first = true;
   int64_t frame = 0;
+  int flow_invocations = 0;
   while (true) {
     BufferHandle buffer_handle;
     decoded_frames.pop(buffer_handle);
@@ -863,6 +884,7 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
     SaveHandle save_handle;
     free_output_buffers.pop(save_handle);
     save_handle.elements = elements;
+    save_handle.stream = Stream::Null();
 
     u8* output_buffer = save_handle.buffer;
 
@@ -887,6 +909,7 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
       auto eval_start = scanner::now();
       cv::cvtColor(image, gray[curr_idx], CV_BGR2GRAY);
       flow->calc(gray[prev_idx], gray[curr_idx], output_flow);
+      flow_invocations++;
       eval_time += scanner::nano_since(eval_start);
     }
 
@@ -894,6 +917,7 @@ void video_flow_cpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
     free_buffers.push(buffer);
   }
   std::unique_lock<std::mutex> lock(TIMINGS_MUTEX);
+  printf("flow invocs %d\n", flow_invocations);
   TIMINGS["load"] += load_time;
   TIMINGS["eval"] += eval_time;
   TIMINGS["save"] += save_time;
@@ -908,6 +932,8 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
   double save_time = 0;
   // Set ourselves to the correct GPU
   cv::cuda::setDevice(gpu_device_id);
+  cv::cuda::setBufferPoolUsage(true);
+  cv::cuda::setBufferPoolConfig(gpu_device_id, 50 * 1024 * 1024, 3);
 
   int frame_size = width * height * 4 * sizeof(u8);
 
@@ -919,6 +945,7 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
   cv::Ptr<cvc::DenseOpticalFlow> flow =
       cvc::FarnebackOpticalFlow::create(3, 0.5, false, 15, 3, 5, 1.2, 0);
 
+  std::vector<cvc::Stream> streams;
   int64_t frame = 0;
   while (true) {
     BufferHandle buffer_handle;
@@ -934,23 +961,24 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
     save_handle.elements = elements;
 
     u8* output_buffer = save_handle.buffer;
-    cvc::Stream stream = cvc::StreamAccessor::wrapStream(save_handle.stream);
 
     // Load the first frame
     auto eval_first = scanner::now();
-    cvc::GpuMat image(height, width, CV_8UC4, buffer);
-    cvc::cvtColor(image, gray[0], CV_BGRA2GRAY, 0, stream);
+    gray.resize(elements);
+    streams.resize(elements);
+    for (int i = 0; i < elements; ++i) {
+      cvc::GpuMat image(height, width, CV_8UC4, buffer + i * frame_size);
+      cvc::cvtColor(image, gray[i], CV_BGRA2GRAY, 0, streams[i]);
+    }
     eval_time += scanner::nano_since(eval_first);
     bool done = false;
     for (int i = 1; i < elements; ++i) {
-      int curr_idx = i % 2;
-      int prev_idx = (i - 1) % 2;
+      int curr_idx = i;
+      int prev_idx = (i - 1);
       cvc::GpuMat output_flow_gpu(height, width, CV_32FC2,
                                   output_buffer + i * output_element_size);
-      cvc::GpuMat image(height, width, CV_8UC4, buffer + i * frame_size);
 
       auto eval_start = scanner::now();
-      cvc::cvtColor(image, gray[curr_idx], CV_BGRA2GRAY, 0, stream);
       flow->calc(gray[prev_idx], gray[curr_idx], output_flow_gpu, stream);
       eval_time += scanner::nano_since(eval_start);
     }
@@ -1069,18 +1097,6 @@ void video_caffe_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
   input_blob->Reshape({NET_BATCH_SIZE, input_blob->shape(1),
                        input_blob->shape(2), input_blob->shape(3)});
 
-
-  // Setup caffe batch transformer
-  caffe::TransformationParameter param;
-  std::vector<float>& mean_colors = descriptor.mean_colors;
-  param.set_force_color(true);
-  if (descriptor.normalize) {
-    param.set_scale(1.0 / 255.0);
-  }
-  for (int i = 0; i < mean_colors.size(); i++) {
-    param.add_mean_value(mean_colors[i]);
-  }
-  caffe::DataTransformer<float> transformer(param, caffe::TEST);
 
   net->Forward();
 
@@ -1230,7 +1246,7 @@ int main(int argc, char** argv) {
   scanner::internal::set_database_path(db_path);
 
   bool cpu_decoder = false;
-  bool scanner_decode = false;
+  bool scanner_decode = true;
 
   DecoderFn decoder_fn;
   WorkerFn worker_fn;
@@ -1258,6 +1274,7 @@ int main(int argc, char** argv) {
     BATCH_SIZE = 8;      // Batch size for network
     BATCH_SIZE = 1;      // Batch size for network
     cpu_decoder = true;
+    scanner_decode = true;
     worker_fn = video_flow_cpu_worker;
     output_element_size = 2 * height * width * sizeof(f32);
   } else if (OPERATION == "flow_gpu") {
@@ -1385,15 +1402,16 @@ int main(int argc, char** argv) {
       int keyframe_idx = 1;
       int start_frame = 0;
       while (current_frame < total_frames) {
-        if (current_frame + STRIDE >= keyframes[keyframe_idx]) {
+        if (current_frame >= keyframes[keyframe_idx]) {
           // Insert current keyframe block
           TASK_RANGES.push_back(std::make_tuple(start_frame, current_frame));
           printf("range %ld, %ld\n", start_frame, current_frame);
           start_frame = current_frame;
           // Search for next keyframe start
           int64_t next_frame =
-              std::min(current_frame + STRIDE, keyframes.back() - 1);
+              std::min(current_frame, keyframes.back() - 1);
           for (int i = keyframe_idx; i < keyframes.size(); ++i) {
+            printf("keyframe %d\n", keyframes[i]);
             if (next_frame < keyframes[i]) {
               keyframe_idx = i;
               break;
@@ -1436,7 +1454,7 @@ int main(int argc, char** argv) {
     }
     for (size_t i = 0; i < TASK_RANGES.size(); ++i) {
       auto& kv = TASK_RANGES[i];
-      //printf("s/e: %d-%d\n", std::get<0>(kv), std::get<1>(kv));
+      printf("s/e: %d-%d\n", std::get<0>(kv), std::get<1>(kv));
       task_ids.push(i);
     }
 

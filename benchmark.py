@@ -34,17 +34,25 @@ DEVNULL = open(os.devnull, 'wb', 0)
 DB_PATH = '/tmp/scanner_db'
 DEBUG = False
 
+CRISSY_NUM_CPUS = 16
+CRISSY_NUM_GPUS = 4
+
+GCE_NUM_CPUS = 16
+GCE_NUM_GPUS = 8
+
 def clear_filesystem_cache():
     os.system('sudo sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"')
 
 
-def make_db(opts={}):
+def make_db(master=None, workers=None, opts={}):
     config_path = opts['config_path'] if 'config_path' in opts else None
     db_path = opts['db_path'] if 'db_path' in opts else DB_PATH
     config = Config(config_path, db_path=db_path)
     #return Database(master='localhost:5001', workers=['localhost:5003'],
     #                config=config)
-    return Database(debug=True,
+    return Database(master=master,
+                    workers=workers,
+                    debug=True if master is None else False,
                     config=config)
 
 
@@ -323,8 +331,8 @@ def video_encoding_benchmark_2():
 
             clear_filesystem_cache()
             start = now()
-            out = db.run(jobs, force = True, show_progress = True)
-                             #pipeline_instances_per_node = 1)
+            out = db.run(jobs, force = True, show_progress = True,
+                             pipeline_instances_per_node = 8)
             t = now() - start
             if profile is not None:
                 out[0].profiler().write_trace('{}.trace'.format(profile))
@@ -355,29 +363,32 @@ def video_encoding_benchmark_2():
             for (input_video, vid_name) in zip(input_videos, vid_names):
                 if not db.has_table(vid_name):
                     print('Resizing baseline to {}'.format(vid_name))
-                    frame = db.table(input_video).as_op().all()
+                    frame = db.table(input_video).as_op().all(task_size=250)
                     resized = db.ops.Resize(
                         frame = frame, width = width, height = height,
                         device = DeviceType.CPU)
                     job = Job(columns = [resized], name = vid_name)
                     t = now()
-                    out = db.run(job, force = True)
+                    out = db.run(job, force = True,
+                                 pipeline_instances_per_node=16)
                     print('{:.3f}'.format(now() - t))
                     #out.profiler().write_trace('resized.trace')
 
             for (img_name, vid_name) in zip(img_names, vid_names):
                 if not db.has_table(img_name):
                     print('Dumping frames to {}'.format(img_name))
-                    frame = db.table(vid_name).as_op().all()
+                    frame = db.table(vid_name).as_op().all(task_size=250)
                     img = db.ops.ImageEncoder(frame = frame)
                     job = Job(columns = [img], name = img_name)
                     t = now()
-                    db.run(job, force = True)
+                    db.run(job, force = True,
+                           pipeline_instances_per_node=16)
                     print('{:.3f}'.format(now() - t))
 
             for k in times:
                 times[k][scale] = {}
 
+            task_size = 250
             for stride in [1, 4]:
                 if stride == 1:
                     fn = lambda item: lambda t: t.all(task_size=item)
@@ -870,15 +881,18 @@ def standalone_benchmark(video, tests):
         start = time.time()
         program_path = os.path.join(
             COMPARISON_DIR, 'build/standalone/standalone_comparison')
-        p = subprocess.Popen([
-            program_path,
-            '--paths_file', paths_file,
-            '--operation', operation,
-            '--frames', str(frames),
-            '--stride', str(stride),
-            '--decode_type', decode_type,
-            '--decode_args', decode_args,
-        ], env=current_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        cmd = [program_path,
+               '--paths_file', paths_file,
+               '--operation', operation,
+               '--frames', str(frames),
+               '--stride', str(stride),
+               '--decode_type', decode_type,
+               '--decode_args', decode_args]
+        print(' '.join(cmd))
+        p = subprocess.Popen(cmd,
+                             env=current_env,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
         so, se = p.communicate()
         rc = p.returncode
         elapsed = time.time() - start
@@ -989,18 +1003,18 @@ def scanner_benchmark(video, tests):
         descriptor = NetDescriptor.from_file(db, 'nets/googlenet.toml')
     caffe_args = db.protobufs.CaffeArgs()
     caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
-    caffe_args.batch_size = 128
+    caffe_args.batch_size = 96
 
     def caffe_pipeline(device):
         def fn(frame):
             caffe_input = db.ops.CaffeInput(
                 frame=frame,
-                batch=128,
+                batch=96,
                 args=caffe_args,
                 device=device)
             return db.ops.Caffe(
                 caffe_frame=caffe_input,
-                batch=128,
+                batch=96,
                 args=caffe_args,
                 device=device)
         return fn
@@ -1064,7 +1078,13 @@ def scanner_benchmark(video, tests):
         # Parse settings
         opts = settings
         opts['work_item_size'] = 256 if is_gpu else 64
-        with make_db() as db:
+        if 'nodes' in opts:
+            master = opts['nodes'][0]
+            workers = opts['nodes'][1:]
+        else:
+            master = None
+            workers = None
+        with make_db(master=master, workers=workers) as db:
             print('Running {:s}'.format(name))
 
             sampling_type = sampling[0]
@@ -1233,8 +1253,8 @@ def peak_benchmark(video, tests):
         os.system('mkdir -p {}'.format(test_output_dir))
 
         frames = total_frames
-        if op == 'flow_cpu' or op == 'flow_gpu':
-            frames = 8632
+        #if op == 'flow_cpu' or op == 'flow_gpu':
+        #    frames = 8632
 
         # for opencv or ffmpeg
         video_paths = split_videos(paths, '/tmp/peak_videos', tt, seg)
@@ -1674,84 +1694,6 @@ def striding_comparison_benchmark():
     graph.striding_comparison_graphs(strides, results)
 
 
-def multi_gpu_comparison_benchmark():
-    small_video = '/n/scanner/wcrichto.new/videos/movies/private/meanGirls.mp4'
-    small_video_frames = 139301
-    large_video = '/n/scanner/wcrichto.new/videos/movies/private/fightClub.mp4'
-    large_video_frames = 200158
-
-    videos = [
-        #('small', small_video, small_video_frames),
-        ('large', large_video, large_video_frames),
-    ]
-
-    # base_tests = [
-    #     {'name': 'flow_gpu',
-    #      'sampling': ('all',),
-    #      'scanner_settings': {
-    #          'item_size': 1024,
-    #          'gpu_pool': '3G',
-    #      }},
-    #     {'name': 'histogram_gpu',
-    #      'sampling': ('all',),
-    #      'scanner_settings': {
-    #          'item_size': 2048,
-    #          'gpu_pool': '6G',
-    #      }},
-    #     {'name': 'caffe',
-    #      'sampling': ('all',),
-    #      'scanner_settings': {
-    #          'item_size': 2048,
-    #          'gpu_pool': '4G',
-    #      }}
-    # ]
-
-
-    base_tests = [
-    {'name': 'gather_hist_gpu',
-     'sampling': ('strided', 500),
-     'scanner_settings': {
-         'item_size': 20,
-         'gpu_pool': '4G',
-     }},
-        {'name': 'flow_gpu',
-         'sampling': ('range', [[0, 10000]]),
-         'scanner_settings': {
-             'item_size': 1024,
-             'gpu_pool': '3G',
-         }},
-        {'name': 'histogram_gpu',
-         'sampling': ('range', [[0, 100000]]),
-         'scanner_settings': {
-             'item_size': 2048,
-             'gpu_pool': '6G',
-         }},
-        {'name': 'caffe',
-         'sampling': ('range', [[0, 100000]]),
-         'scanner_settings': {
-             'item_size': 2048,
-             'gpu_pool': '5G',
-         }},
-    ]
-
-    gpus = [1, 2, 4]
-    tests = []
-    for g in gpus:
-        for t in base_tests:
-            b = copy.deepcopy(t)
-            b['name'] += "_{:d}".format(g)
-            b['scanner_settings']['pipeline_instances_per_node'] = 1
-            b['scanner_settings']['nodes'] = ['localhost:500{:d}'.format(i + 2)
-                                              for i in range(g)]
-            tests.append(b)
-
-    for name, video, frames in videos:
-         r = scanner_benchmark(video, frames, tests)
-         pprint(name)
-         pprint(r)
-         graph.multi_gpu_comparison_graphs(name, gpus, r)
-
-
 def surround360_single_node_benchmark():
     cmd_args = (
         '--flow_alg pixflow_search_20 ' +
@@ -1844,7 +1786,7 @@ def make_video_interval(total_frames):
     return [
         (f - (total_frames / 100), f)
         for f in range(total_frames / 10, total_frames + 1,
-                       total_frames / 10)]
+                       total_frames / 20)]
 
 DATA_PREFIX = '/n/scanner/'
 SMALL_FC = 139301
@@ -1878,11 +1820,12 @@ VIDEOS = {
             'strided_short': ('strided', 24),
             'strided_long': ('strided', 500),
             'range': ('range', make_video_interval(LARGE_FC)),
-            'hist_cpu_all': ('range', [[0, LARGE_FC]]),
-            'caffe_all': ('range', [[0, LARGE_FC / 4]]),
-            'flow_cpu_all': ('range', [[0, LARGE_FC / 12]]),
+            'hist_cpu_all': ('range', [[0, (2**17 + 2**16)/3]]),
+            'caffe_all': ('range', [[0, LARGE_FC / 2]]),
+            'flow_cpu_all': ('range', [[0, LARGE_FC / 48]]),
             #'flow_cpu_all': ('range', [[0, 100]]),
-            'flow_gpu_all': ('range', [[0, LARGE_FC / 20]]),
+            #'flow_gpu_all': ('range', [[0, LARGE_FC / 10]]),
+            'flow_gpu_all': ('range', [[0, 10240 * 8]]),
         }
     }
 }
@@ -2007,29 +1950,39 @@ def write_results(path, results):
         json.dump(results, f)
 
 def read_results(path):
-    with open(path, 'r') as f:
-        return json.load(f)
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            return json.load(f)
+    else:
+        return {}
 
 def run_full_comparison(prefix, video, tests):
     standalone_results = read_results(
         '{:s}_standalone_results.json'.format(prefix))
     scanner_results = read_results('{:s}_scanner_results.json'.format(prefix))
-    # peak_results = read_results('{:s}_peak_results.json'.format(prefix))
-    peak_results = scanner_results
+    peak_results = read_results('{:s}_peak_results.json'.format(prefix))
 
-    recalculate = True
+    recalculate = False
+    write_results = False
     if recalculate:
         #standalone_results = standalone_benchmark(video, tests)
-        write_results('{:s}_standalone_results.json'.format(prefix),
-                      standalone_results)
+        if write_results:
+            write_results('{:s}_standalone_results.json'.format(prefix),
+                          standalone_results)
 
-        #scanner_results = scanner_benchmark(video, tests)
-        write_results('{:s}_scanner_results.json'.format(prefix),
-                      scanner_results)
+        # results = scanner_benchmark(video, tests)
+        # for k, v in results.iteritems():
+        #     scanner_results[k] = v
+        if write_results:
+            write_results('{:s}_scanner_results.json'.format(prefix),
+                          scanner_results)
 
-        peak_results = peak_benchmark(video, tests)
-        write_results('{:s}_peak_results.json'.format(prefix),
-                      peak_results)
+        # results = peak_benchmark(video, tests)
+        # for k, v in results.iteritems():
+        #     peak_results[k] = v
+        if write_results:
+            write_results('{:s}_peak_results.json'.format(prefix),
+                          peak_results)
 
 
     return {'baseline': standalone_results,
@@ -2144,6 +2097,36 @@ def data_loading_benchmarks():
              'seg': '5',
          }}
     ]
+    tests = [
+        {'name': 'gather_cpu',
+         'sampling': 'strided_long',
+         'scanner_settings': {
+             'cpu_pool': '32G',
+             'task_size': 1,
+             'pipeline_instances_per_node': 16
+         },
+         'peak_settings': {
+             'decoders': 16,
+             'evaluators': 1,
+             'tt': '',
+             'seg': '5',
+         }},
+    ]
+    tests = [
+        {'name': 'decode_cpu',
+         'sampling': 'all',
+         'scanner_settings': {
+             'task_size': 2048,
+             'cpu_pool': '32G',
+             'pipeline_instances_per_node': 16
+         },
+         'peak_settings': {
+             'decoders': 16,
+             'evaluators': 1,
+             'tt': '',
+             'seg': '5',
+         }},
+    ]
     # decode
     # stride
     # gather
@@ -2177,54 +2160,28 @@ def micro_apps_benchmarks():
     # dnn
     # optical flow
     tests = [
-        {'name': 'flow_gpu',
-         'sampling': 'flow_gpu_all',
-         'scanner_settings': {
-             'task_size': 128,
-             'work_item_size': 8,
-             'gpu_pool': '3G',
-             'pipeline_instances_per_node': 1
-         },
-         'peak_settings': {
-             'decoders': 1,
-             'evaluators': 1,
-             'tt': '-ss 00:00:00 -t 00:06:00',
-             'seg': '5',
-         }},
-        {'name': 'histogram_cpu',
-         'sampling': 'hist_cpu_all',
-         'scanner_settings': {
-             'task_size': 2048,
-             'cpu_pool': '32G',
-             'pipeline_instances_per_node': 32
-         },
-         'peak_settings': {
-             'decoders': 16,
-             'evaluators': 16,
-             'tt': '',
-             'seg': '180',
-         }},
-        {'name': 'histogram_gpu',
-         'sampling': 'all',
-         'scanner_settings': {
-             'task_size': 2048,
-             'work_item_size': 128,
-             'gpu_pool': '2G',
-             'pipeline_instances_per_node': 1
-         },
-         'peak_settings': {
-             'decoders': 1,
-             'evaluators': 1,
-             'tt': '',
-             'seg': '180',
-         }},
+        # {'name': 'flow_gpu',
+        #  'sampling': 'flow_gpu_all',
+        #  'scanner_settings': {
+        #      'task_size': 128,
+        #      'work_item_size': 8,
+        #      'gpu_pool': '3G',
+        #      'pipeline_instances_per_node': 1
+        #  },
+        #  'peak_settings': {
+        #      'decoders': 1,
+        #      'evaluators': 1,
+        #      'tt': '-ss 00:00:00 -t 00:06:00',
+        #      'seg': '5',
+        #  }},
         {'name': 'caffe',
          'sampling': 'caffe_all',
          'scanner_settings': {
              'task_size': 2048,
              'work_item_size': 128,
              'gpu_pool': '5G',
-             'pipeline_instances_per_node': 1
+             'pipeline_instances_per_node': 1,
+             'tasks_in_queue_per_pu': 2
          },
          'peak_settings': {
              'decoders': 1,
@@ -2232,20 +2189,48 @@ def micro_apps_benchmarks():
              'tt': '',
              'seg': '180',
          }},
-        {'name': 'flow_cpu',
-         'sampling': 'flow_cpu_all',
-         'scanner_settings': {
-             'task_size': 132,
-             'work_item_size': 4,
-             'cpu_pool': '32g',
-             'pipeline_instances_per_node': 32
-         },
-         'peak_settings': {
-             'decoders': 1,
-             'evaluators': 32,
-             'tt': '-ss 00:00:00 -t 00:06:00',
-             'seg': '5',
-         }},
+        # {'name': 'histogram_cpu',
+        #  'sampling': 'hist_cpu_all',
+        #  'scanner_settings': {
+        #      'task_size': 2048,
+        #      'work_item_size': 128,
+        #      'cpu_pool': '32G',
+        #      'pipeline_instances_per_node': 16
+        #  },
+        #  'peak_settings': {
+        #      'decoders': 16,
+        #      'evaluators': 16,
+        #      'tt': '',
+        #      'seg': '180',
+        #  }},
+        # {'name': 'histogram_gpu',
+        #  'sampling': 'hist_cpu_all',
+        #  'scanner_settings': {
+        #      'task_size': 4096,
+        #      'work_item_size': 256,
+        #      'gpu_pool': '2G',
+        #      'pipeline_instances_per_node': 1
+        #  },
+        #  'peak_settings': {
+        #      'decoders': 1,
+        #      'evaluators': 1,
+        #      'tt': '',
+        #      'seg': '180',
+        #  }},
+        # {'name': 'flow_cpu',
+        #  'sampling': 'flow_cpu_all',
+        #  'scanner_settings': {
+        #      'task_size': 66,
+        #      'work_item_size': 4,
+        #      'cpu_pool': '16g',
+        #      'pipeline_instances_per_node': 32
+        #  },
+        #  'peak_settings': {
+        #      'decoders': 1,
+        #      'evaluators': 32,
+        #      'tt': '-ss 00:00:00 -t 00:06:00',
+        #      'seg': '5',
+        #  }},
     ]
     video_name = 'large'
     results = run_full_comparison('micro', VIDEOS[video_name], tests)
@@ -2264,9 +2249,122 @@ def micro_apps_benchmarks():
                             results['scanner'],
                             results['peak'])
 
+def multi_gpu_benchmarks():
+    gpus = CRISSY_NUM_GPUS
+    tests = [
+        # {'name': 'decode_gpu',
+        #  'sampling': 'all',
+        #  'scanner_settings': {
+        #      'task_size': 8500,
+        #      'gpu_pool': '2G',
+        #      'pipeline_instances_per_node': gpus
+        #  }},
+        # {'name': 'stride_gpu',
+        #  'sampling': 'strided_short',
+        #  'scanner_settings': {
+        #      'task_size': 425,
+        #      'gpu_pool': '2G',
+        #      'pipeline_instances_per_node': gpus
+        #  }},
+        # {'name': 'gather_gpu',
+        #  'sampling': 'strided_long',
+        #  'scanner_settings': {
+        #      'gpu_pool': '4G',
+        #      'task_size': 1,
+        #      'pipeline_instances_per_node': gpus
+        #  }},
+        # {'name': 'range_gpu',
+        #  'sampling': 'range',
+        #  'scanner_settings': {
+        #      'task_size': 1266,
+        #      'gpu_pool': '2g',
+        #      'pipeline_instances_per_node': gpus
+        #  }},
+        # {'name': 'histogram_gpu',
+        #  'sampling': 'hist_cpu_all',
+        #  'scanner_settings': {
+        #      'task_size': 4096,
+        #      'work_item_size': 256,
+        #      'gpu_pool': '2G',
+        #      'pipeline_instances_per_node': gpus
+        #  }},
+        # {'name': 'flow_gpu',
+        #  'sampling': 'flow_gpu_all',
+        #  'scanner_settings': {
+        #      'task_size': 320,
+        #      'work_item_size': 32,
+        #      'gpu_pool': '2G',
+        #      #'cpu_pool': 'p32G',
+        #      'pipeline_instances_per_node': gpus
+        #  }},
+        {'name': 'caffe',
+         'sampling': 'caffe_all',
+         'scanner_settings': {
+             'task_size': 384,
+             'work_item_size': 96,
+             'gpu_pool': '4425M',
+             'pipeline_instances_per_node': 1,
+             'nodes': ['crissy.pdl.local.cmu.edu:{:d}'.format(p)
+                       for p in range(5005, 5010)],
+             'tasks_in_queue_per_pu': 2
+         }},
+    ]
+    # decode
+    # stride
+    # gather
+    # range
+    # join
+    video_name = 'large'
+    video = VIDEOS[video_name]
+    multi_gpu_results = read_results(
+        'multi_gpu_results.json')
+    num_gpus = [1, 2, 4]
+    #num_gpus = [1]
+    multi_gpu_tests = []
+    for gpus in num_gpus:
+        for test in tests:
+            new_test = copy.deepcopy(test)
+            new_test['name'] += '_{:d}'.format(gpus)
+            settings = new_test['scanner_settings']
+            if 'nodes' in settings:
+                settings['nodes'] = ['crissy.pdl.local.cmu.edu:500{:d}'
+                                     .format(p)
+                                     for p in range(5, 5 + gpus + 1)]
+            else:
+                settings['pipeline_instances_per_node'] = gpus
+            multi_gpu_tests.append(new_test)
+    # results = scanner_benchmark(video, multi_gpu_tests)
+    # for k, v in results.iteritems():
+    #    multi_gpu_results[k] = v
+    # pprint(results)
+    # write_results('multi_gpu_results.json', multi_gpu_results)
+
+    ops = ['decode_gpu',
+           'stride_gpu',
+           'gather_gpu',
+           'range_gpu',
+           'histogram_gpu',
+           'caffe',
+           'flow_gpu']
+    labels = ['DECODEGPU',
+              'STRIDEGPU',
+              'GATHERGPU',
+              'RANGEGPU',
+              'HISTGPU',
+              'DNN',
+              'FLOWGPU']
+    graph.multi_gpu_comparison_graphs(video_name,
+                                      VIDEOS[video_name],
+                                      num_gpus,
+                                      ops,
+                                      labels,
+                                      multi_gpu_results)
+
+
 BENCHMARKS = {
     'load': data_loading_benchmarks,
     'micro': micro_apps_benchmarks,
+    'multi': multi_gpu_benchmarks,
     'enc': video_encoding_benchmark_2,
     'surround360': surround360_single_node_benchmark,
     'decode_sol': decode_sol,
@@ -2281,3 +2379,4 @@ def bench_main(args):
     assert test in BENCHMARKS
     fn = BENCHMARKS[test]
     fn()
+
