@@ -87,10 +87,7 @@ def run_trial(db, jobs, opts={}):
             del os.environ['FORCE_CPU_DECODE']
         if no_pipelining:
             del os.environ['NO_PIPELINING']
-        if isinstance(out_table, list):
-            prof = out_table[0].profiler()
-        else:
-            prof = out_table.profiler()
+        prof = out_table[0].profiler() if isinstance(out_table, list) else out_table.profiler()
         elapsed = now() - start
         total = prof.total_time_interval()
         t = (total[1] - total[0])
@@ -325,7 +322,7 @@ def video_encoding_benchmark_2():
         '/n/scanner/datasets/movies/private/interstellar_2014.mp4']
 
     with Database() as db:
-        def decode(ts, fn, image = False, device = DeviceType.CPU, profile = None, num_jobs = 1):
+        def decode(ts, fn, image = False, device = DeviceType.CPU, profile = None):
             jobs = []
             for t in ts:
                 t = db.table(t)
@@ -339,13 +336,11 @@ def video_encoding_benchmark_2():
                 job = Job(columns = [dummy], name = 'ignore_{}'.format(t.name()))
                 jobs.append(job)
 
-            clear_filesystem_cache()
-            start = now()
-            out = db.run(jobs, force = True, show_progress = True,
-                             pipeline_instances_per_node = 8)
-            t = now() - start
+            success, t, prof = run_trial(db, jobs)
+            assert(success)
             if profile is not None:
-                out[0].profiler().write_trace('{}.trace'.format(profile))
+                prof.write_trace('{}.trace'.format(profile))
+
             return t
 
         for input_video in input_videos:
@@ -359,16 +354,43 @@ def video_encoding_benchmark_2():
         times = {
             'vid_cpu': {},
             'vid_gpu': {},
+            'vid_smallgop_cpu': {},
+            'vid_smallgop_gpu': {},
+            'vid_strided_cpu': {},
+            'vid_strided_gpu': {},
             'img_cpu': {},
-            'img_gpu': {}
         }
 
-        for scale in [8]:
+        sizes = {
+            'vid': {},
+            'vid_strided': {},
+            'vid_smallgop': {},
+            'img': {}
+        }
+
+        def table_size(table):
+            tid = db.table(table).id()
+            path = '{}/tables/{}'.format(db._db_path, tid)
+            return subprocess.check_output(['du', '-bh', path]).split('\t')[0]
+
+        for scale in [1, 4]:
             width = (input_width / scale) // 2 * 2
             height = (input_height / scale) // 2 * 2
 
+            strides = [1, 2, 4, 8, 16, 32, 64]
+
             vid_names = ['{}_{}'.format(input_video, scale) for input_video in input_videos]
+            vid_smallgop_names = ['{}_{}_smallgop'.format(input_video, scale) for input_video in input_videos]
+            vid_strided_names = [['{}_{}_strided_{}'.format(input_video, scale, stride) for stride in strides]
+                                     for input_video in input_videos]
             img_names = ['{}_{}_img'.format(input_video, scale) for input_video in input_videos]
+
+            sizes['vid'][scale] = []
+            sizes['vid_smallgop'][scale] = []
+            sizes['vid_strided'][scale] = {}
+            for stride in strides:
+                sizes['vid_strided'][scale][stride] = []
+            sizes['img'][scale] = []
 
             for (input_video, vid_name) in zip(input_videos, vid_names):
                 if not db.has_table(vid_name):
@@ -377,12 +399,39 @@ def video_encoding_benchmark_2():
                     resized = db.ops.Resize(
                         frame = frame, width = width, height = height,
                         device = DeviceType.CPU)
-                    job = Job(columns = [resized], name = vid_name)
+                    job = Job(columns = [resized.compress_video()], name = vid_name)
                     t = now()
                     out = db.run(job, force = True,
                                  pipeline_instances_per_node=16)
                     print('{:.3f}'.format(now() - t))
-                    #out.profiler().write_trace('resized.trace')
+                sizes['vid'][scale].append(table_size(vid_name))
+
+            for (vid_name, names) in zip(vid_names, vid_strided_names):
+                for (stride, vid_strided_name) in zip(strides, names):
+                    if not db.has_table(vid_strided_name):
+                        print('Re encoding with stride for {}'.format(vid_strided_name))
+                        frame = db.table(vid_name).as_op().strided(stride, task_size=200)
+                        frame = db.ops.PassthroughFrame(frame = frame)
+                        job = Job(columns = [
+                            frame.compress_video()],
+                            name = vid_strided_name)
+                        t = now()
+                        out = db.run(job, force=True, pipeline_instances_per_node=16)
+                        print('{:.3f}'.format(now() - t))
+                    sizes['vid_strided'][scale][stride].append(table_size(vid_strided_name))
+
+            for (vid_name, vid_smallgop_name) in zip(vid_names, vid_smallgop_names):
+                if not db.has_table(vid_smallgop_name):
+                    print('Re encoding with small gop for {}'.format(vid_smallgop_name))
+                    frame = db.table(vid_name).as_op().all(task_size=200)
+                    frame = db.ops.PassthroughFrame(frame = frame)
+                    job = Job(columns = [
+                        frame.compress_video(keyframe_distance=24)],
+                        name = vid_smallgop_name)
+                    t = now()
+                    out = db.run(job, force=True, pipeline_instances_per_node=10)
+                    print('{:.3f}'.format(now() - t))
+                sizes['vid_smallgop'][scale].append(table_size(vid_smallgop_name))
 
             for (img_name, vid_name) in zip(img_names, vid_names):
                 if not db.has_table(img_name):
@@ -394,30 +443,44 @@ def video_encoding_benchmark_2():
                     db.run(job, force = True,
                            pipeline_instances_per_node=16)
                     print('{:.3f}'.format(now() - t))
+                sizes['img'][scale].append(table_size(img_name))
+
+            pprint(sizes)
 
             for k in times:
                 times[k][scale] = {}
 
-            task_size = 250
-            for stride in [1, 4]:
+            for j, stride in enumerate(strides):
                 if stride == 1:
                     fn = lambda item: lambda t: t.all(task_size=item)
                 else:
                     fn = lambda item: lambda t: t.strided(stride, task_size=item)
 
-                t = decode(vid_names, fn(1000)) #profile='vid_cpu_{}'.format(scale))
-                times['vid_cpu'][scale][stride] = t
+                # t = decode(vid_names, fn(1000)) #profile='vid_cpu_{}'.format(scale))
+                # times['vid_cpu'][scale][stride] = t
 
-                t = decode(vid_names, fn(1000), device = DeviceType.GPU)  #profile='vid_gpu_{}'.format(scale))
-                times['vid_gpu'][scale][stride] = t
+                # t = decode(vid_names, fn(1000), device = DeviceType.GPU)  #profile='vid_gpu_{}'.format(scale))
+                # times['vid_gpu'][scale][stride] = t
 
-                t = decode(img_names, fn(10), image = True) #profile = 'img_cpu_{}'.format(stride))
-                times['img_cpu'][scale][stride] = t
+                # t = decode(vid_smallgop_names, fn(1000)) #profile='vid_cpu_{}'.format(scale))
+                # times['vid_smallgop_cpu'][scale][stride] = t
 
-                # t = decode(img_names, fn(10), image = True, device = DeviceType.GPU)
-                # times['img_gpu'][scale][stride] = t
+                # t = decode(vid_smallgop_names, fn(1000), device = DeviceType.GPU)  #profile='vid_gpu_{}'.format(scale))
+                # times['vid_smallgop_gpu'][scale][stride] = t
+
+                t = decode([l[j] for l in vid_strided_names], lambda t: t.all(task_size=1000),
+                               device = DeviceType.CPU)
+                times['vid_strided_cpu'][scale][stride] = t
+
+                t = decode([l[j] for l in vid_strided_names], lambda t: t.all(task_size=1000),
+                               device = DeviceType.GPU)
+                times['vid_strided_gpu'][scale][stride] = t
+
+                # t = decode(img_names, fn(1000), image = True) #profile = 'img_cpu_{}'.format(stride))
+                # times['img_cpu'][scale][stride] = t
 
                 pprint(times)
+
 
 def video_encoding_benchmark():
     input_video = '/bigdata/wcrichto/videos/charade_short.mkv'
@@ -2344,7 +2407,7 @@ def multi_gpu_benchmarks():
     # range
     # join
     only_graph = True
-    
+
     video_name = 'large'
     video = VIDEOS[video_name]
     multi_gpu_results = read_results(
@@ -2426,4 +2489,3 @@ def bench_main(args):
     assert test in BENCHMARKS
     fn = BENCHMARKS[test]
     fn()
-
