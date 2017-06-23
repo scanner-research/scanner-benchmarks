@@ -238,17 +238,17 @@ def cpm_ablation_benchmark():
             batch_size = opts['work_item_size']
             input_op = db.table(input_video).as_op()
             def histogram():
-                frame = input_op.range(0, 40000, task_size = task_size*10)
+                frame = input_op.all(task_size = task_size*10)
                 histogram = db.ops.Histogram(frame=frame, device=DeviceType.GPU)
                 return histogram
 
             def flow_gpu():
-                frame = input_op.range(0, 4000, task_size = task_size)
+                frame = input_op.range(0, 20000, task_size = task_size)
                 flow = db.ops.OpticalFlow(frame=frame, batch=batch_size, device=DeviceType.GPU)
                 return db.ops.DiscardFrame(ignore=flow, device=DeviceType.GPU)
 
             def cpm():
-                frame = input_op.range(0, 1000, task_size = task_size / 4)
+                frame = input_op.range(0, 10000, task_size = task_size / 5)
                 frame_info = db.ops.InfoFromFrame(frame = frame)
                 caffe_args.batch_size = 1
                 cpm2_input = db.ops.CPM2Input(
@@ -276,11 +276,11 @@ def cpm_ablation_benchmark():
 
             job = Job(columns = [pipelines[pipeline]()], name = 'example_poses')
             success, total, prof = run_trial(db, job, opts)
-            prof.write_trace('{}.trace'.format(k))
+            prof.write_trace('{}_{}.trace'.format(pipeline, k))
             return total
 
         timings = {}
-        for pipeline in ['cpm', 'histogram', 'flow_gpu']:
+        for pipeline in ['flow_gpu']:
             options = {
                 'pipeline_instances_per_node': 1,
                 'no_pipelining': True,
@@ -289,12 +289,17 @@ def cpm_ablation_benchmark():
                 'force_cpu_decode': True,
             }
             values = [
-                ('pipeline_instances_per_node', 4),
                 ('no_pipelining', False),
+                ('pipeline_instances_per_node', 4),
                 ('force_cpu_decode', False),
                 ('task_size', 200),
+                ('cpu_pool', 'p20G'),
+                ('gpu_pool', '2G'),
                 ('work_item_size', 8)]
+            if pipeline == 'flow_gpu':
+                del values[4:6]
 
+            # timings[pipeline] = []
             timings[pipeline] = \
               [('baseline', run(pipeline, 'baseline', options))]
             pprint(timings)
@@ -302,6 +307,7 @@ def cpm_ablation_benchmark():
 
             for (k, v) in values:
                 options[k] = v
+                # if k == 'task_size':
                 t = run(pipeline, k, options)
                 timings[pipeline].append((k, t))
                 pprint(timings)
