@@ -31,7 +31,8 @@ SCANNER_DIR = os.path.join(SCRIPT_DIR, '..', 'scanner')
 COMPARISON_DIR = os.path.join(SCRIPT_DIR, 'comparison')
 DEVNULL = open(os.devnull, 'wb', 0)
 
-DB_PATH = '/tmp/scanner_db'
+#DB_PATH = '/tmp/scanner_db'
+DB_PATH = '/n/scanner/apoms/dbs/bench_db'
 DEBUG = False
 
 CRISSY_NUM_CPUS = 16
@@ -86,7 +87,10 @@ def run_trial(db, jobs, opts={}):
             del os.environ['FORCE_CPU_DECODE']
         if no_pipelining:
             del os.environ['NO_PIPELINING']
-        prof = out_table.profiler()
+        if isinstance(out_table, list):
+            prof = out_table[0].profiler()
+        else:
+            prof = out_table.profiler()
         elapsed = now() - start
         total = prof.total_time_interval()
         t = (total[1] - total[0])
@@ -1057,7 +1061,10 @@ def scanner_benchmark(video, tests):
     total_frames = video['frames']
     table_name = 'test_video'
     with make_db() as db:
-        _, f = db.ingest_videos([(table_name, video_path)], force=True)
+        _, f = db.ingest_videos([(table_name, video_path),
+                                 (table_name + '_2', video_path),
+                                 (table_name + '_3', video_path),
+                                 (table_name + '_4', video_path)], force=True)
         assert(len(f) == 0)
 
     results = {}
@@ -1096,29 +1103,34 @@ def scanner_benchmark(video, tests):
             sampling_type = sampling[0]
             print(sampling)
 
-            table = db.table(table_name).as_op()
-            if sampling_type == 'all':
-                sampled_input = table.all(task_size=task_size)
-                frames = total_frames
-            elif sampling_type == 'strided':
-                sampled_input = table.strided(sampling[1],
-                                             task_size=task_size)
-                frames = total_frames / sampling[1]
-            elif sampling_type == 'gather':
-                sampled_input = table.gather(sampling[1],
-                                             task_size=task_size)
-                frames = len(sampling[1])
-            elif sampling_type == 'range':
-                sampled_input = table.ranges(sampling[1],
-                                             task_size=task_size)
-                frames = sum(e - s for s, e in sampling[1])
-            else:
-                print('Not a valid sampling type:', sampling_type)
-                exit(1)
+            jobs = []
+            frames = 0
+            for t_name in [table_name, table_name + '_2',
+                           table_name + '_3', table_name + '_4']:
+                table = db.table(t_name).as_op()
+                if sampling_type == 'all':
+                    sampled_input = table.all(task_size=task_size)
+                    frames += total_frames
+                elif sampling_type == 'strided':
+                    sampled_input = table.strided(sampling[1],
+                                                 task_size=task_size)
+                    frames += total_frames / sampling[1]
+                elif sampling_type == 'gather':
+                    sampled_input = table.gather(sampling[1],
+                                                 task_size=task_size)
+                    frames += len(sampling[1])
+                elif sampling_type == 'range':
+                    sampled_input = table.ranges(sampling[1],
+                                                 task_size=task_size)
+                    frames += sum(e - s for s, e in sampling[1])
+                else:
+                    print('Not a valid sampling type:', sampling_type)
+                    exit(1)
 
-            frame = sampled_input
-            job = Job(columns=[ops(frame)], name='dummy_output')
-            success, total, prof = run_trial(db, job, opts)
+                frame = sampled_input
+                job = Job(columns=[ops(frame)], name=t_name + '_dummy_output')
+                jobs.append(job)
+            success, total, prof = run_trial(db, jobs, opts)
             assert(success)
             stats = prof.statistics()
             prof.write_trace(name + '.trace')
@@ -1962,13 +1974,12 @@ def read_results(path):
     else:
         return {}
 
-def run_full_comparison(prefix, video, tests):
+def run_full_comparison(prefix, video, tests, recalculate=True):
     standalone_results = read_results(
         '{:s}_standalone_results.json'.format(prefix))
     scanner_results = read_results('{:s}_scanner_results.json'.format(prefix))
     peak_results = read_results('{:s}_peak_results.json'.format(prefix))
 
-    recalculate = False
     write_results = False
     if recalculate:
         #standalone_results = standalone_benchmark(video, tests)
@@ -2139,17 +2150,25 @@ def data_loading_benchmarks():
     # range
     # join
     video_name = 'large'
-    results = run_full_comparison('loading', VIDEOS[video_name], tests)
+    results = run_full_comparison('loading', VIDEOS[video_name], tests, False)
     pprint(results)
 
-    ops = ['decode_cpu', 'decode_gpu',
-           'stride_cpu', 'stride_gpu',
-           'gather_cpu', 'gather_gpu',
-           'range_cpu', 'range_gpu']
-    labels = ['DECODECPU', 'DECODEGPU',
-              'STRIDECPU', 'STRIDEGPU',
-              'GATHERCPU', 'GATHERGPU',
-              'RANGECPU', 'RANGEGPU']
+    ops = ['decode_cpu',
+           'stride_cpu',
+           'gather_cpu',
+           'range_cpu',
+           'decode_gpu',
+           'stride_gpu',
+           'gather_gpu',
+           'range_gpu']
+    labels = ['DECODECPU',
+              'STRIDECPU',
+              'GATHERCPU',
+              'RANGECPU',
+              'DECODEGPU',
+              'STRIDEGPU',
+              'GATHERGPU',
+              'RANGEGPU']
     graph.comparison_graphs('loading_{:s}'.format(video_name),
                             VIDEOS[video_name],
                             ops,
@@ -2239,14 +2258,18 @@ def micro_apps_benchmarks():
         #  }},
     ]
     video_name = 'large'
-    results = run_full_comparison('micro', VIDEOS[video_name], tests)
+    results = run_full_comparison('micro', VIDEOS[video_name], tests, False)
     pprint(results)
 
-    ops = ['histogram_cpu', 'histogram_gpu',
-           'flow_cpu', 'flow_gpu',
+    ops = ['histogram_cpu',
+           'flow_cpu',
+           'histogram_gpu',
+           'flow_gpu',
            'caffe']
-    labels = ['HISTCPU', 'HISTGPU',
-              'FLOWCPU', 'FLOWGPU',
+    labels = ['HISTCPU',
+              'FLOWCPU',
+              'HISTGPU',
+              'FLOWGPU',
               'DNN']
     graph.comparison_graphs('micro_{:s}'.format(video_name),
                             VIDEOS[video_name],
@@ -2258,51 +2281,51 @@ def micro_apps_benchmarks():
 def multi_gpu_benchmarks():
     gpus = CRISSY_NUM_GPUS
     tests = [
-        # {'name': 'decode_gpu',
-        #  'sampling': 'all',
-        #  'scanner_settings': {
-        #      'task_size': 8500,
-        #      'gpu_pool': '2G',
-        #      'pipeline_instances_per_node': gpus
-        #  }},
-        # {'name': 'stride_gpu',
-        #  'sampling': 'strided_short',
-        #  'scanner_settings': {
-        #      'task_size': 425,
-        #      'gpu_pool': '2G',
-        #      'pipeline_instances_per_node': gpus
-        #  }},
-        # {'name': 'gather_gpu',
-        #  'sampling': 'strided_long',
-        #  'scanner_settings': {
-        #      'gpu_pool': '4G',
-        #      'task_size': 1,
-        #      'pipeline_instances_per_node': gpus
-        #  }},
-        # {'name': 'range_gpu',
-        #  'sampling': 'range',
-        #  'scanner_settings': {
-        #      'task_size': 1266,
-        #      'gpu_pool': '2g',
-        #      'pipeline_instances_per_node': gpus
-        #  }},
-        # {'name': 'histogram_gpu',
-        #  'sampling': 'hist_cpu_all',
-        #  'scanner_settings': {
-        #      'task_size': 4096,
-        #      'work_item_size': 256,
-        #      'gpu_pool': '2G',
-        #      'pipeline_instances_per_node': gpus
-        #  }},
-        # {'name': 'flow_gpu',
-        #  'sampling': 'flow_gpu_all',
-        #  'scanner_settings': {
-        #      'task_size': 320,
-        #      'work_item_size': 32,
-        #      'gpu_pool': '2G',
-        #      #'cpu_pool': 'p32G',
-        #      'pipeline_instances_per_node': gpus
-        #  }},
+        {'name': 'decode_gpu',
+         'sampling': 'all',
+         'scanner_settings': {
+             'task_size': 8500,
+             'gpu_pool': '2G',
+             'pipeline_instances_per_node': gpus
+         }},
+        {'name': 'stride_gpu',
+         'sampling': 'strided_short',
+         'scanner_settings': {
+             'task_size': 425,
+             'gpu_pool': '2G',
+             'pipeline_instances_per_node': gpus
+         }},
+        {'name': 'gather_gpu',
+         'sampling': 'strided_long',
+         'scanner_settings': {
+             'gpu_pool': '4G',
+             'task_size': 1,
+             'pipeline_instances_per_node': gpus
+         }},
+        {'name': 'range_gpu',
+         'sampling': 'range',
+         'scanner_settings': {
+             'task_size': 1266,
+             'gpu_pool': '2g',
+             'pipeline_instances_per_node': gpus
+         }},
+        {'name': 'histogram_gpu',
+         'sampling': 'hist_cpu_all',
+         'scanner_settings': {
+             'task_size': 4096,
+             'work_item_size': 256,
+             'gpu_pool': '2G',
+             'pipeline_instances_per_node': gpus
+         }},
+        {'name': 'flow_gpu',
+         'sampling': 'flow_gpu_all',
+         'scanner_settings': {
+             'task_size': 320,
+             'work_item_size': 32,
+             'gpu_pool': '2G',
+             #'cpu_pool': 'p32G',
+             'pipeline_instances_per_node': gpus
+         }},
         {'name': 'caffe',
          'sampling': 'caffe_all',
          'scanner_settings': {
@@ -2320,30 +2343,48 @@ def multi_gpu_benchmarks():
     # gather
     # range
     # join
+    only_graph = True
+    
     video_name = 'large'
     video = VIDEOS[video_name]
     multi_gpu_results = read_results(
         'multi_gpu_results.json')
-    num_gpus = [1, 2, 4]
-    #num_gpus = [1]
+    #num_gpus = [(1, 1), (1, 2), (1, 4), (2, 4)]
+    num_gpus = [(2, 4)]
+    hostnames = ['crissy.pdl.local.cmu.edu', 'ocean.pdl.local.cmu.edu']
     multi_gpu_tests = []
-    for gpus in num_gpus:
+    for nodes, gpus in num_gpus:
+        num_g = nodes * gpus
+        hosts = hostnames[:nodes]
+        master = hosts[0]
         for test in tests:
             new_test = copy.deepcopy(test)
-            new_test['name'] += '_{:d}'.format(gpus)
+            new_test['name'] += '_{:d}'.format(num_g)
             settings = new_test['scanner_settings']
             if 'nodes' in settings:
-                settings['nodes'] = ['crissy.pdl.local.cmu.edu:500{:d}'
-                                     .format(p)
-                                     for p in range(5, 5 + gpus + 1)]
+                settings['nodes'] = [master + ':5001']
+                settings['nodes'] += ['{:s}:500{:d}' .format(host, p)
+                                      for host in hosts
+                                      for p in range(2, 2 + gpus)]
             else:
                 settings['pipeline_instances_per_node'] = gpus
+                if nodes > 1:
+                    settings['nodes'] = [master + ':5001']
+                    settings['nodes'] += ['{:s}:5002'.format(host)
+                                          for host in hosts]
+
+            if 'nodes' in settings: print(settings['nodes'])
             multi_gpu_tests.append(new_test)
-    # results = scanner_benchmark(video, multi_gpu_tests)
-    # for k, v in results.iteritems():
-    #    multi_gpu_results[k] = v
-    # pprint(results)
-    # write_results('multi_gpu_results.json', multi_gpu_results)
+    if not only_graph:
+        results = scanner_benchmark(video, multi_gpu_tests)
+        for k, v in results.iteritems():
+            multi_gpu_results[k] = v
+        pprint(results)
+        write_results('multi_gpu_results.json', multi_gpu_results)
+    else:
+        num_gpus = [(1, 1), (1, 2), (1, 4), (2, 4)]
+
+    num_gpus = [n * g for n, g in num_gpus]
 
     ops = ['decode_gpu',
            'stride_gpu',
@@ -2352,13 +2393,13 @@ def multi_gpu_benchmarks():
            'histogram_gpu',
            'caffe',
            'flow_gpu']
-    labels = ['DECODEGPU',
-              'STRIDEGPU',
-              'GATHERGPU',
-              'RANGEGPU',
-              'HISTGPU',
+    labels = ['DECODE',
+              'STRIDE',
+              'GATHER',
+              'RANGE',
+              'HIST',
               'DNN',
-              'FLOWGPU']
+              'FLOW']
     graph.multi_gpu_comparison_graphs(video_name,
                                       VIDEOS[video_name],
                                       num_gpus,

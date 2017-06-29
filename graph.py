@@ -541,7 +541,7 @@ def multi_gpu_comparison_graphs(name,
                                 labels_on=True):
     scale = 2.5
     w = 3.33 * scale 
-    h = 1.25 * scale
+    h = 1.00 * scale
     fig = plt.figure(figsize=(w, h))
     if False:
         fig.suptitle("GPU scaling on {width}x{height} video".format(
@@ -549,7 +549,7 @@ def multi_gpu_comparison_graphs(name,
             height=video['height']))
     ax = fig.add_subplot(111)
     if labels_on:
-        plt.ylabel("Throughput (Relative to 1 GPU)")
+        plt.ylabel("Throughput\n(Relative to 1 GPU)")
     ax.xaxis.grid(False)
 
     x = np.arange(len(labels)) 
@@ -569,22 +569,22 @@ def multi_gpu_comparison_graphs(name,
         ax.bar(xx, y, 0.15, align='center', color=SCANNER_COLOR,
                     edgecolor='none')
         for (j, xy) in enumerate(zip(xx, y)):
-            if i == 2:
+            if i == 3:
                 xyx = xy[0]
                 xyy = xy[1] + 0.1
                 if labels_on:
                     ax.annotate('{:d}'.format(int(fps[j])),
                                 xy=(xyx, xyy), ha='center')
             if labels_on:
-                ax.annotate("{:d}".format(num_gpus[i]), xy=(xy[0], -0.30),
+                ax.annotate("{:d}".format(num_gpus[i]), xy=(xy[0], -0.90),
                             ha='center', annotation_clip=False)
 
-    yt = range(0, num_gpus[-1] + 1)
+    yt = [0, 2, 4, 8]
     ax.set_yticks(yt)
     ax.set_yticklabels(['{:d}'.format(d) for d in yt])
     ax.set_ylim([0, num_gpus[-1] + 0.2])
 
-    ax.set_xticks(x+0.17)
+    ax.set_xticks(x+0.26)
     ax.set_xticklabels(labels, ha='center')
     ax.tick_params(width=0)
     fig.tight_layout()
