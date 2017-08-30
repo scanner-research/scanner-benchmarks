@@ -68,6 +68,7 @@ def run_trial(db, jobs, opts={}):
     add_opt('cpu_pool')
     add_opt('gpu_pool')
     add_opt('pipeline_instances_per_node')
+    add_opt('tasks_in_queue_per_pu')
 
     force_cpu_decode = \
       opts['force_cpu_decode'] if 'force_cpu_decode' in opts else False
@@ -223,95 +224,134 @@ def get_trial_total_io_read(result):
     return total_io
 
 def cpm_ablation_benchmark():
-    input_video = '/home/will/data/excalibur_1981.mp4'
-    with Database() as db:
+    # input_video = '/n/scanner/datasets/panoptic/160422_mafia2/vgaVideos/vga_01_01.mp4'
+    input_video = '/n/scanner/datasets/movies/private/excalibur_1981.mp4'
+
+    with make_db() as db:
         if not db.has_table(input_video):
             db.ingest_videos([(input_video, input_video)])
 
         descriptor = NetDescriptor.from_file(db, 'nets/cpm2.toml')
         cpm2_args = db.protobufs.CPM2Args()
-        cpm2_args.scale = 368.0/1080.0
+        cpm2_args.scale = 368.0/480.0
         caffe_args = cpm2_args.caffe_args
         caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
 
-        def run(pipeline, k, opts):
-            task_size = opts['task_size']
-            batch_size = opts['work_item_size']
-            input_op = db.table(input_video).as_op()
-            def histogram():
-                frame = input_op.all(task_size = task_size*10)
-                histogram = db.ops.Histogram(frame=frame, device=DeviceType.GPU)
-                return histogram
+    def run(db, pipeline, k, opts):
+        task_size = opts['task_size']
+        work_item_size = opts['work_item_size']
+        batch = opts['batch']
+        input_op = db.table(input_video).as_op()
 
-            def flow_gpu():
-                frame = input_op.range(0, 20000, task_size = task_size)
-                flow = db.ops.OpticalFlow(frame=frame, batch=batch_size, device=DeviceType.GPU)
-                return db.ops.DiscardFrame(ignore=flow, device=DeviceType.GPU)
+        def histogram():
+            frame = input_op.range(0, 20000, task_size = task_size)
+            histogram = db.ops.Histogram(frame=frame, device=DeviceType.GPU)
+            return histogram
 
-            def cpm():
-                frame = input_op.range(0, 10000, task_size = task_size / 5)
-                frame_info = db.ops.InfoFromFrame(frame = frame)
-                caffe_args.batch_size = 1
-                cpm2_input = db.ops.CPM2Input(
-                    frame = frame,
-                    args = cpm2_args,
-                    device = DeviceType.GPU,
-                    batch = batch_size)
-                cpm2_resized_map, cpm2_joints = db.ops.CPM2(
-                    cpm2_input = cpm2_input,
-                    args = cpm2_args,
-                    device = DeviceType.GPU,
-                    batch = batch_size)
-                return db.ops.CPM2Output(
-                    cpm2_resized_map = cpm2_resized_map,
-                    cpm2_joints = cpm2_joints,
-                    original_frame_info = frame_info,
-                    args = cpm2_args,
-                    batch = batch_size)
+        def flow_gpu():
+            frame = input_op.range(0, 10000, task_size = task_size)
+            flow = db.ops.OpticalFlow(frame=frame, batch=batch, device=DeviceType.GPU)
+            return db.ops.DiscardFrame(ignore=flow, device=DeviceType.GPU)
 
-            pipelines = {
-                'histogram': histogram,
-                'flow_gpu': flow_gpu,
-                'cpm': cpm
-            }
+        def cpm():
+            frame = input_op.range(0, 22500, task_size = task_size)
+            frame_info = db.ops.InfoFromFrame(frame = frame)
+            caffe_args.batch_size = 1
+            cpm2_input = db.ops.CPM2Input(
+                frame = frame,
+                args = cpm2_args,
+                device = DeviceType.GPU,
+                batch = batch_size)
+            cpm2_resized_map, cpm2_joints = db.ops.CPM2(
+                cpm2_input = cpm2_input,
+                args = cpm2_args,
+                device = DeviceType.GPU,
+                batch = batch_size)
+            return db.ops.CPM2Output(
+                cpm2_resized_map = cpm2_resized_map,
+                cpm2_joints = cpm2_joints,
+                original_frame_info = frame_info,
+                args = cpm2_args,
+                batch = batch_size)
 
-            job = Job(columns = [pipelines[pipeline]()], name = 'example_poses')
-            success, total, prof = run_trial(db, job, opts)
-            prof.write_trace('{}_{}.trace'.format(pipeline, k))
-            return total
+        def caffe():
+            # Caffe benchmark
+            descriptor = NetDescriptor.from_file(db, 'nets/googlenet.toml')
+            caffe_args = db.protobufs.CaffeArgs()
+            caffe_args.net_descriptor.CopyFrom(descriptor.as_proto())
+            caffe_args.batch_size = batch
 
-        timings = {}
-        for pipeline in ['flow_gpu']:
-            options = {
-                'pipeline_instances_per_node': 1,
-                'no_pipelining': True,
-                'work_item_size': 1,
-                'task_size': 10000,
-                'force_cpu_decode': True,
-            }
-            values = [
-                ('no_pipelining', False),
-                ('pipeline_instances_per_node', 4),
-                ('force_cpu_decode', False),
-                ('task_size', 200),
-                ('cpu_pool', 'p20G'),
-                ('gpu_pool', '2G'),
-                ('work_item_size', 8)]
-            if pipeline == 'flow_gpu':
-                del values[4:6]
+            frame = input_op.range(0, 20000, task_size = task_size)
+            caffe_input = db.ops.CaffeInput(
+                frame=frame,
+                batch=batch,
+                args=caffe_args,
+                device=DeviceType.GPU)
+            return db.ops.Caffe(
+                caffe_frame=caffe_input,
+                batch=batch,
+                args=caffe_args,
+                device=DeviceType.GPU)
 
-            # timings[pipeline] = []
+        pipelines = {
+            'histogram': histogram,
+            'flow_gpu': flow_gpu,
+            'cpm': cpm,
+            'caffe': caffe
+        }
+
+        job = Job(columns = [pipelines[pipeline]()], name = 'example_poses')
+        success, total, prof = run_trial(db, job, opts)
+        prof.write_trace('{}_{}.trace'.format(pipeline, k))
+        return total
+
+    timings = {}
+    for pipeline in ['flow_gpu']:
+        options = {
+            'pipeline_instances_per_node': 1,
+            'no_pipelining': True,
+            'work_item_size': 1,
+            'batch': 1,
+            'task_size': 1000,
+            'force_cpu_decode': True,
+            'tasks_in_queue_per_pu': 1,
+            'io_item_size': 1000
+        }
+
+        values = [
+            ('pipeline_instances_per_node', 4),
+            ('no_pipelining', False),
+            ('force_cpu_decode', False),
+            ('gpu_pool', '4425M'),
+            ('work_item_size', 96),
+            ('batch', 96)]
+        # if pipeline == 'flow_gpu':
+        #     del values[4:6]
+
+        timings[pipeline] = []
+        with make_db() as db:
             timings[pipeline] = \
-              [('baseline', run(pipeline, 'baseline', options))]
-            pprint(timings)
-            options['task_size'] = 20
+              [('baseline', run(db, pipeline, 'baseline', options))]
+        pprint(timings)
 
-            for (k, v) in values:
-                options[k] = v
-                # if k == 'task_size':
-                t = run(pipeline, k, options)
-                timings[pipeline].append((k, t))
-                pprint(timings)
+        for (k, v) in values:
+            options[k] = v
+            if k == 'no_pipelining':
+                options['tasks_in_queue_per_pu'] = 4
+
+            if k == 'pipeline_instances_per_node':
+                if pipeline == 'caffe':
+                    options['pipeline_instances_per_node'] = 1
+
+            if pipeline == 'caffe':
+                nodes = ['ocean.pdl.local.cmu.edu:500{:d}'.format(i) for i in range(5)]
+                with make_db(master=nodes[0], workers=nodes[1:]) as db:
+                    t = run(db, pipeline, k, options)
+            else:
+                with make_db() as db:
+                    t = run(db, pipeline, k, options)
+            timings[pipeline].append((k, t))
+            pprint(timings)
 
 
 # TODO: re-encode video from stride
@@ -2396,7 +2436,7 @@ def multi_gpu_benchmarks():
              'work_item_size': 96,
              'gpu_pool': '4425M',
              'pipeline_instances_per_node': 1,
-             'nodes': ['crissy.pdl.local.cmu.edu:{:d}'.format(p)
+             'nodes': ['ocean.pdl.local.cmu.edu:{:d}'.format(p)
                        for p in range(5005, 5010)],
              'tasks_in_queue_per_pu': 2
          }},
