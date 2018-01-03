@@ -16,9 +16,10 @@ import numpy.random
 def hist_job(db, device, opts, num_frames, video_names, sampling):
     print('Computing a color histogram for each frame...')
     s = time.time()
-    batch = 10000
+    batch = 20000
+    failures = 0
     for bi, i in enumerate(range(0, len(video_names), batch)):
-        print('Batch {:d}...'.format(bi))
+        print('Batch {:d}/{:d}...'.format(bi), ceil(len(video_names)/batch))
         frame = db.ops.FrameInput()
         histogram = db.ops.Histogram(
             frame = frame,
@@ -37,7 +38,14 @@ def hist_job(db, device, opts, num_frames, video_names, sampling):
             jobs.append(job)
         bulk_job = BulkJob(output=output, jobs=jobs)
         hist_tables = db.run(bulk_job, force=True, **opts)
+        local_failures = 0
+        for t in hist_tables:
+            if not t.committed():
+                local_failures += 1
+        print('Batch failures: {:d}'.format(local_failures))
+        failures += local_failures
 
+    print('Total failures: {:d}'.format(failures))
     print('\nTime: {:.1f}s, {:.1f} fps'.format(
         time.time() - s,
         num_frames / (time.time() - s)))
@@ -145,8 +153,9 @@ def main(dataset, workload, num_workers):
             total_frames = 0
             for n in valid_names:
                 vid_frames = db.table(n).num_rows()
-                shot_interval = numpy.random.normal(loc=shot_interval_mean,
-                                                    scale=shot_interval_stddev)
+                shot_interval = int(numpy.random.normal(
+                    loc=shot_interval_mean,
+                    scale=shot_interval_stddev))
                 if vid_frames < shot_interval + 1:
                     start = 0
                     end = vid_frames
