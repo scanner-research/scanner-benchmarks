@@ -13,32 +13,37 @@ import random
 import numpy.random
 
 
-def hist_job(db, num_frames, video_names, sampling):
+def hist_job(db, device, opts, num_frames, video_names, sampling):
     print('Computing a color histogram for each frame...')
-    frame = db.ops.FrameInput()
-    histogram = db.ops.Histogram(
-        frame = frame,
-        device = device)
-    hist_sample = histogram.sample()
-    output = db.ops.Output(columns=[hist_sample])
-
-    jobs = []
-    for name, sa in zip(video_names, sampling):
-        job = Job(op_args={
-            frame: db.table(name).column('frame'),
-            hist_sample: sa,
-            output: name + '_hist'
-        })
-        jobs.append(job)
-    bulk_job = BulkJob(output=output, jobs=jobs)
     s = time.time()
-    hist_tables = db.run(bulk_job, force=True)
+    batch = 10000
+    for bi, i in enumerate(range(0, len(video_names), batch)):
+        print('Batch {:d}...'.format(bi))
+        frame = db.ops.FrameInput()
+        histogram = db.ops.Histogram(
+            frame = frame,
+            device = device)
+        hist_sample = histogram.sample()
+        output = db.ops.Output(columns=[hist_sample])
+
+        jobs = []
+        for name, sa in zip(video_names[i:i+batch],
+                            sampling[i:i+batch]):
+            job = Job(op_args={
+                frame: db.table(name).column('frame'),
+                hist_sample: sa,
+                output: name + '_hist'
+            })
+            jobs.append(job)
+        bulk_job = BulkJob(output=output, jobs=jobs)
+        hist_tables = db.run(bulk_job, force=True, **opts)
+
     print('\nTime: {:.1f}s, {:.1f} fps'.format(
         time.time() - s,
         num_frames / (time.time() - s)))
 
 
-def openpose_job(db, num_frames, video_names, sampling):
+def openpose_job(db, device, pi, num_frames, video_names, sampling):
     print('Computing pose for each frame...')
     s = time.time()
     poses = scannerpy.stdlib.pipelines.detect_poses(
@@ -71,7 +76,6 @@ def main(dataset, workload, num_workers):
         work_fn = openpose_job
         stride = 30
 
-    movie_name = os.path.basename(movie_path)
     with open(videos_path, 'r') as f:
         movie_paths = [l.strip() for l in f.readlines()]
     movie_names = [os.path.basename(p) for p in movie_paths]
@@ -86,14 +90,24 @@ def main(dataset, workload, num_workers):
 
         if db.has_gpu():
             device = DeviceType.GPU
+            opts = {
+                'pipeline_instances_per_node': 1,
+                'work_packet_size': 128,
+                'io_packet_size': 4096,
+            }
         else:
             device = DeviceType.CPU
+            opts = {
+                'pipeline_instances_per_node': 8,
+                'work_packet_size': 128,
+                'io_packet_size': 2048,
+            }
 
         ############ ############ ############ ############
         # 0. Ingest the video into the database
         ############ ############ ############ ############
-        print('Ingest start...')
         if not db.has_table(movie_names[-1]):
+            print('Ingest start...')
             batch = 10000
             for i in range(0, len(movie_names), batch):
                 print('Ingesting {:d}/{:d}....'.format(i, len(movie_names)))
@@ -104,7 +118,7 @@ def main(dataset, workload, num_workers):
                         has_not.append((tn, tp))
                 if len(has_not) > 0:
                     movie_tables, failures = db.ingest_videos(
-                        has_not
+                        has_not,
                         force=True,
                         inplace=inplace)
         print('Time: {:.1f}s'.format(time.time() - s))
@@ -158,7 +172,7 @@ def main(dataset, workload, num_workers):
         # 1. Run Histogram over the entire video in Scanner
         ############ ############ ############ ############
 
-        work_fn(db, num_frames, valid_names, sampling)
+        work_fn(db, device, opts, num_frames, valid_names, sampling)
 
         exit(0)
 
