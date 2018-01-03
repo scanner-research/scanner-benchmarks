@@ -8,8 +8,8 @@ import cv2
 import math
 import sys
 import os.path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '/../..')
-import util
+import time
+
 
 def hist_job(db, num_frames, video_names, sampling):
     print('Computing a color histogram for each frame...')
@@ -69,15 +69,15 @@ def main(dataset, workload, num_workers):
         work_fn = openpose_job
         stride = 30
 
-    print('Detecting shots in movie {}'.format(movie_path))
     movie_name = os.path.basename(movie_path)
     with open(videos_path, 'r') as f:
         movie_paths = [l.strip() for l in f.readlines()]
     movie_names = [os.path.basename(p) for p in movie_paths]
 
     # Use GPU kernels if we have a GPU
-    master = 'scanner-apoms-1'
-    workers = ['scanner-apoms-{:d}'.format(d) for d in num_workers]
+    master = 'scanner-apoms-1:5001'
+    workers = ['scanner-apoms-{:d}:5002'.format(
+        d) for d in range(1, num_workers + 1)]
     with Database(master=master, workers=workers) as db:
         print('Loading movie into Scanner database...')
         s = time.time()
@@ -91,17 +91,18 @@ def main(dataset, workload, num_workers):
         # 0. Ingest the video into the database
         ############ ############ ############ ############
         print('Ingest start...')
-        if not db.table(movie_names[-1]):
-            batch = 1000
+        if not db.has_table(movie_names[-1]):
+            batch = 10000
             for i in range(0, len(movie_names), batch):
                 print('Ingesting {:d}/{:d}....'.format(i, len(movie_names)))
-                has_all = True
-                for tn in movie_names[i:i + batch]:
+                has_not = []
+                for tn, tp in zip(movie_names[i:i + batch],
+                                  movie_paths[i:i+batch]):
                     if not db.has_table(tn) or not db.table(tn).committed():
-                        has_all = False
-                if not has_all:
+                        has_not.append((tn, tp))
+                if len(has_not) > 0:
                     movie_tables, failures = db.ingest_videos(
-                        zip(movie_names[i:i+batch], movie_paths[i:i+batch]),
+                        has_not
                         force=True,
                         inplace=inplace)
         print('Time: {:.1f}s'.format(time.time() - s))
