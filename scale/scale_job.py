@@ -9,6 +9,8 @@ import math
 import sys
 import os.path
 import time
+import random
+import numpy.random
 
 
 def hist_job(db, num_frames, video_names, sampling):
@@ -123,10 +125,14 @@ def main(dataset, workload, num_workers):
             # Random shots
             sampling = []
             random.seed(1234)
-            shot_interval = 600
+            numpy.random.seed(1234)
+            shot_interval_mean = 600
+            shot_interval_stddev = 150
             total_frames = 0
             for n in valid_names:
                 vid_frames = db.table(n).num_rows()
+                shot_interval = numpy.random.normal(loc=shot_interval_mean,
+                                                    scale=shot_interval_stddev)
                 if vid_frames < shot_interval + 1:
                     start = 0
                     end = vid_frames
