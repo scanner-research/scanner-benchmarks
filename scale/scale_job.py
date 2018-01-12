@@ -10,6 +10,7 @@ import os.path
 import time
 import random
 import numpy.random
+import operator
 
 
 def hist_job(db, device, opts, num_frames, video_names, sampling):
@@ -194,6 +195,7 @@ def main(dataset, workload, num_workers):
                     last_end = end
                     ranges.append((start, end))
                     total_frames += (end - start)
+                ranges.sort(key = operator.itemgetter(0))
                 sampling.append(db.sampler.strided_ranges(ranges, stride))
             num_frames = total_frames
             print('Number of frames in movies: {:d}'.format(num_frames))
