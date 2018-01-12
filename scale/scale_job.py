@@ -1,7 +1,6 @@
 from scannerpy import Database, DeviceType, Job, BulkJob
 from scannerpy.stdlib import parsers
 from scipy.spatial import distance
-from subprocess import check_call as run
 import scannerpy.stdlib.pipelines
 import numpy as np
 import cv2
@@ -18,8 +17,9 @@ def hist_job(db, device, opts, num_frames, video_names, sampling):
     s = time.time()
     batch = 20000
     failures = 0
+    max_batches = int(math.ceil(len(video_names)/batch))
     for bi, i in enumerate(range(0, len(video_names), batch)):
-        print('Batch {:d}/{:d}...'.format(bi), ceil(len(video_names)/batch))
+        print('Batch {:d}/{:d}...'.format(bi, max_batches))
         frame = db.ops.FrameInput()
         histogram = db.ops.Histogram(
             frame = frame,
@@ -45,10 +45,12 @@ def hist_job(db, device, opts, num_frames, video_names, sampling):
         print('Batch failures: {:d}'.format(local_failures))
         failures += local_failures
 
+    total_time = time.time() - s
     print('Total failures: {:d}'.format(failures))
     print('\nTime: {:.1f}s, {:.1f} fps'.format(
-        time.time() - s,
-        num_frames / (time.time() - s)))
+        total_time,
+        num_frames / (total_time)))
+    return total_time
 
 
 def openpose_job(db, device, pi, num_frames, video_names, sampling):
@@ -59,9 +61,11 @@ def openpose_job(db, device, pi, num_frames, video_names, sampling):
         [db.table(tn).column('frame') for tn in video_names],
         sampling,
         'test_poses')
+    total_time = time.time() - s
     print('Time: {:.1f}s, {:.1f} fps'.format(
-        time.time() - s,
-        num_frames / (time.time() - s)))
+        total_time,
+        num_frames / (total_time)))
+    return total_time
 
 
 def main(dataset, workload, num_workers):
@@ -181,7 +185,10 @@ def main(dataset, workload, num_workers):
         # 1. Run Histogram over the entire video in Scanner
         ############ ############ ############ ############
 
-        work_fn(db, device, opts, num_frames, valid_names, sampling)
+        total_time = work_fn(db, device, opts, num_frames, valid_names, sampling)
+
+        with open('time.txt', 'w') as f:
+            f.write(str(total_time))
 
         exit(0)
 
