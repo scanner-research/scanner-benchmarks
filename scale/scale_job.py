@@ -158,20 +158,24 @@ def main(dataset, workload, num_workers):
             numpy.random.seed(1234)
             shot_interval_mean = 600
             shot_interval_stddev = 150
+            num_shots = 3
             total_frames = 0
             for n in valid_names:
                 vid_frames = db.table(n).num_rows()
-                shot_interval = int(numpy.random.normal(
-                    loc=shot_interval_mean,
-                    scale=shot_interval_stddev))
-                if vid_frames < shot_interval + 1:
-                    start = 0
-                    end = vid_frames
-                else:
-                    start = random.randint(0, vid_frames - shot_interval)
-                    end = start + shot_interval
-                sampling.append(db.sampler.strided_range(start, end, stride))
-                total_frames += (end - start)
+                ranges = []
+                for shot in range(num_shots):
+                    shot_interval = int(numpy.random.normal(
+                        loc=shot_interval_mean,
+                        scale=shot_interval_stddev))
+                    if vid_frames < shot_interval + 1:
+                        start = 0
+                        end = vid_frames
+                    else:
+                        start = random.randint(0, vid_frames - shot_interval)
+                        end = start + shot_interval
+                    ranges.append((start, end))
+                    total_frames += (end - start)
+                sampling.append(db.sampler.strided_ranges(ranges, stride))
             num_frames = total_frames
             print('Number of frames in movies: {:d}'.format(num_frames))
         elif dataset == 'cinema':
