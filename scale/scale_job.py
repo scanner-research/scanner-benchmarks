@@ -163,6 +163,8 @@ def main(dataset, workload, num_workers):
             for n in valid_names:
                 vid_frames = db.table(n).num_rows()
                 ranges = []
+                last_start = -1
+                last_end = -1
                 for shot in range(num_shots):
                     shot_interval = int(numpy.random.normal(
                         loc=shot_interval_mean,
@@ -171,8 +173,22 @@ def main(dataset, workload, num_workers):
                         start = 0
                         end = vid_frames
                     else:
-                        start = random.randint(0, vid_frames - shot_interval)
-                        end = start + shot_interval
+                        ATTEMPTS = 20
+                        attempt = 0
+                        while attempt < ATTEMPTS:
+                            start = random.randint(0, vid_frames - shot_interval)
+                            end = start + shot_interval
+                            attempt += 1
+                            if start >= last_start and start <= last_end:
+                                continue
+                            if end >= last_start and end <= last_end:
+                                continue
+                            if start <= last_start and end >= last_end:
+                                continue
+                        if attempt == ATTEMPTS:
+                            continue
+                    last_start = start
+                    last_end = end
                     ranges.append((start, end))
                     total_frames += (end - start)
                 sampling.append(db.sampler.strided_ranges(ranges, stride))
