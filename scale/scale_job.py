@@ -106,6 +106,8 @@ def main(dataset, workload, num_workers):
                 'pipeline_instances_per_node': 1,
                 'work_packet_size': 128,
                 'io_packet_size': 4096,
+                'task_timeout': 120,
+                'checkpoint_frequency': 40000,
             }
         else:
             device = DeviceType.CPU
@@ -113,6 +115,8 @@ def main(dataset, workload, num_workers):
                 'pipeline_instances_per_node': 8,
                 'work_packet_size': 128,
                 'io_packet_size': 2048,
+                'task_timeout': 120,
+                'checkpoint_frequency': 40000,
             }
 
         ############ ############ ############ ############
