@@ -170,6 +170,8 @@ def main(dataset, workload, num_workers):
                         loc=shot_interval_mean,
                         scale=shot_interval_stddev))
                     if vid_frames < shot_interval + 1:
+                        if shot > 0:
+                            continue
                         start = 0
                         end = vid_frames
                     else:
@@ -185,6 +187,7 @@ def main(dataset, workload, num_workers):
                                 continue
                             if start <= last_start and end >= last_end:
                                 continue
+                            break
                         if attempt == ATTEMPTS:
                             continue
                     last_start = start
