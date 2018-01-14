@@ -20,12 +20,11 @@ def run_quiet(cmd):
         return subprocess.check_call(cmd, shell=True,
                                      stdout=devnull, stderr=devnull)
 # Shutdown nodes
-print('Running initial node shutdown...')
-run_quiet('bash cinematography_shutdown_nodes.sh 2 {:d}'.format(500))
-
 if run_cpu_tests:
-    cpu_results = []
     print('Running cpu tests')
+    print('Running initial node shutdown...')
+    run_quiet('bash cinematography_shutdown_nodes.sh 2 {:d}'.format(500))
+    cpu_results = []
     for i in range(iterations):
         print('Iteration {:d}'.format(i))
         for nodes in cpu_nodes:
@@ -54,6 +53,8 @@ if run_cpu_tests:
 if run_gpu_tests:
     gpu_results = []
     print('Running gpu tests')
+    print('Running initial node shutdown...')
+    run_quiet('bash cinematography_shutdown_nodes_gpu.sh 2 {:d}'.format(500))
     for i in range(iterations):
         print('Iteration {:d}'.format(i))
         for nodes in gpu_nodes:

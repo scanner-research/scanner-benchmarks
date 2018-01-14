@@ -39,7 +39,7 @@ for j in `seq 0 $num_simul $max`; do
         gcloud compute --project "visualdb-1046" \
                instances create "scanner-apoms-$i" \
                --zone "us-east1-d" \
-               --machine-type "n1-standard-8" \
+               --machine-type "n1-highmem-8" \
                --network "default" \
                --metadata "ssh-keys=apoms:$SSH_KEY,node_id=$i" \
                --maintenance-policy "TERMINATE" \
