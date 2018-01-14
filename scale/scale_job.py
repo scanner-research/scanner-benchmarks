@@ -182,7 +182,7 @@ def main(dataset, workload, num_workers):
                             start = random.randint(0, vid_frames - shot_interval)
                             end = start + shot_interval
                             attempt += 1
-                            if len(set_ranges.intersection(start, end)) > 0:
+                            if len(set_ranges.intersection(range(start, end))) > 0:
                                 continue
                             break
                         if attempt == ATTEMPTS:

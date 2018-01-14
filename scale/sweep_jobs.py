@@ -12,8 +12,10 @@ gpu_workloads = ['hist', 'pose']
 
 datasets = ['tvnews']
 
+num_gpus_per_node = 2
+
 cpu_nodes = [10, 50, 100, 150, 200, 250, 300]
-gpu_nodes = [10, 50, 100, 150, 200, 256]
+gpu_nodes = [n / 2 for n in [10, 50, 100, 150, 200, 256]]
 
 def run_quiet(cmd):
     with open(os.devnull, 'w') as devnull:
