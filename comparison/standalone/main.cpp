@@ -146,10 +146,26 @@ void video_decode_range_cpu_worker(int gpu_device_id,
 
   std::vector<int64_t> range_start;
   std::vector<int64_t> range_end;
-  for (auto s : split(DECODE_ARGS, ',')) {
-    std::vector<std::string> se = split(s, ':');
-    range_start.push_back(atoi(se[0].c_str()));
-    range_end.push_back(atoi(se[1].c_str()));
+  if (DECODE_TYPE == "gather") {
+    std::string gather_path = DECODE_ARGS;
+    // Read gather frames from file
+
+    std::ifstream infile(gather_path);
+    std::string line;
+    while (std::getline(infile, line)) {
+      if (line == "") {
+        break;
+      }
+      int64_t frame = std::atoi(line.c_str());
+      range_start.push_back(frame);
+      range_end.push_back(frame + 1);
+    }
+  } else {
+    for (auto s : split(DECODE_ARGS, ',')) {
+      std::vector<std::string> se = split(s, ':');
+      range_start.push_back(atoi(se[0].c_str()));
+      range_end.push_back(atoi(se[1].c_str()));
+    }
   }
 
   cv::VideoCapture video;
@@ -270,11 +286,28 @@ void video_decode_range_gpu_worker(int gpu_device_id,
 
   std::vector<int64_t> range_start;
   std::vector<int64_t> range_end;
-  for (auto s : split(DECODE_ARGS, ',')) {
-    std::vector<std::string> se = split(s, ':');
-    range_start.push_back(atoi(se[0].c_str()));
-    range_end.push_back(atoi(se[1].c_str()));
+  if (DECODE_TYPE == "gather") {
+    std::string gather_path = DECODE_ARGS;
+    // Read gather frames from file
+
+    std::ifstream infile(gather_path);
+    std::string line;
+    while (std::getline(infile, line)) {
+      if (line == "") {
+        break;
+      }
+      int64_t frame = std::atoi(line.c_str());
+      range_start.push_back(frame);
+      range_end.push_back(frame + 1);
+    }
+  } else {
+    for (auto s : split(DECODE_ARGS, ',')) {
+      std::vector<std::string> se = split(s, ':');
+      range_start.push_back(atoi(se[0].c_str()));
+      range_end.push_back(atoi(se[1].c_str()));
+    }
   }
+
 
   cv::cuda::setDevice(gpu_device_id);
   cv::Ptr<cv::cudacodec::VideoReader> video;
@@ -897,9 +930,11 @@ int main(int argc, char** argv) {
   } else if (operation == "decode_gpu" || operation == "stride_gpu" ||
              operation == "gather_gpu") {
     worker_fn = video_decode_gpu_worker;
-  } else if (operation == "range_cpu") {
+  } else if (operation == "range_cpu" ||
+             operation == "keyframe_cpu") {
     worker_fn = video_decode_range_cpu_worker;
-  } else if (operation == "range_gpu") {
+  } else if (operation == "range_gpu" ||
+             operation == "keyframe_gpu") {
     worker_fn = video_decode_range_gpu_worker;
   } else if (operation == "histogram_cpu") {
     worker_fn = video_histogram_cpu_worker;

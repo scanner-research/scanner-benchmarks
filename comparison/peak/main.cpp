@@ -1177,6 +1177,8 @@ void video_caffe_worker(int gpu_device_id, Queue<u8 *> &free_buffers,
 }
 
 int main(int argc, char** argv) {
+  avcodec_register_all();
+
   std::string video_list_path;
   std::string scanner_video_args;
   std::string db_path;
@@ -1251,14 +1253,16 @@ int main(int argc, char** argv) {
   DecoderFn decoder_fn;
   WorkerFn worker_fn;
   if (OPERATION == "decode_cpu" || OPERATION == "stride_cpu" ||
-      OPERATION == "gather_cpu" || OPERATION == "range_cpu") {
+      OPERATION == "gather_cpu" || OPERATION == "range_cpu" ||
+      OPERATION == "keyframe_cpu") {
     BATCH_SIZE = 64;
     cpu_decoder = true;
     scanner_decode = true;
     worker_fn = video_decode_worker;
     output_element_size = 1;
   } else if (OPERATION == "decode_gpu" || OPERATION == "stride_gpu" ||
-             OPERATION == "gather_gpu" || OPERATION == "range_gpu") {
+             OPERATION == "gather_gpu" || OPERATION == "range_gpu" ||
+             OPERATION == "keyframe_gpu") {
     BATCH_SIZE = 64;
     scanner_decode = true;
     worker_fn = video_decode_worker;
@@ -1388,7 +1392,7 @@ int main(int argc, char** argv) {
 
     printf("decode type %s\n", DECODE_TYPE.c_str());
     // Break up work into keyframe sized chunks
-    auto& keyframes = index_entry.keyframe_positions;
+    auto& keyframes = index_entry.keyframe_indices;
     if (DECODE_TYPE == "all") {
       for (int i = 1; i < keyframes.size(); ++i) {
         int64_t start = keyframes[i - 1];
@@ -1409,7 +1413,7 @@ int main(int argc, char** argv) {
           start_frame = current_frame;
           // Search for next keyframe start
           int64_t next_frame =
-              std::min(current_frame, keyframes.back() - 1);
+              std::min(current_frame, (int64_t)(keyframes.back() - 1));
           for (int i = keyframe_idx; i < keyframes.size(); ++i) {
             printf("keyframe %d\n", keyframes[i]);
             if (next_frame < keyframes[i]) {
@@ -1451,7 +1455,23 @@ int main(int argc, char** argv) {
         }
         TASK_RANGES.push_back(std::make_tuple(start, re));
       }
+    } else if (DECODE_TYPE == "gather") {
+      // Read task file path
+      std::string gather_path = DECODE_ARGS;
+      // Read gather frames from file
+
+      std::ifstream infile(gather_path);
+      std::string line;
+      while (std::getline(infile, line)) {
+        if (line == "") {
+          break;
+        }
+        int64_t frame = std::atoi(line.c_str());
+        TASK_RANGES.push_back(std::make_tuple(frame, frame + 1));
+      }
     }
+
+
     for (size_t i = 0; i < TASK_RANGES.size(); ++i) {
       auto& kv = TASK_RANGES[i];
       printf("s/e: %d-%d\n", std::get<0>(kv), std::get<1>(kv));

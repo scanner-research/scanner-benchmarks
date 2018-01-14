@@ -18,7 +18,7 @@ from timeit import default_timer as now
 import string
 import random
 import glob
-from scannerpy import Database, DeviceType, ScannerException, Job
+from scannerpy import Database, DeviceType, ScannerException, Job, BulkJob
 from scannerpy.stdlib import NetDescriptor
 from scannerpy.config import Config
 import numpy as np
@@ -57,14 +57,15 @@ def make_db(master=None, workers=None, opts={}):
                     config=config)
 
 
-def run_trial(db, jobs, opts={}):
+def run_trial(db, bulk_job, opts={}):
     print('Running trial...')
     # Clear cache
     scanner_opts = {'profiling': True}
     def add_opt(s):
         if s in opts:
             scanner_opts[s] = opts[s]
-    add_opt('work_item_size')
+    add_opt('io_packet_size')
+    add_opt('work_packet_size')
     add_opt('cpu_pool')
     add_opt('gpu_pool')
     add_opt('pipeline_instances_per_node')
@@ -83,7 +84,7 @@ def run_trial(db, jobs, opts={}):
             os.environ['FORCE_CPU_DECODE'] = ''
         if no_pipelining:
             os.environ['NO_PIPELINING'] = ''
-        out_table = db.run(jobs, force=True, **scanner_opts)
+        out_table = db.run(bulk_job, force=True, **scanner_opts)
         if force_cpu_decode:
             del os.environ['FORCE_CPU_DECODE']
         if no_pipelining:
@@ -964,20 +965,6 @@ def standalone_benchmark(video, tests):
     test_output_dir = '/tmp/standalone_outputs'
     paths_file = os.path.join(output_dir, 'paths.txt')
 
-    def read_meta(path):
-        files = [name for name in os.listdir(path)
-                 if os.path.isfile(os.path.join(path, name))]
-        filename = os.path.join(path, files[0])
-        with Image.open(filename) as im:
-            width, height = im.size
-        return {'num_images': len(files) - 2, 'width': width, 'height': height}
-
-    def write_meta_file(path, meta):
-        with open(os.path.join(path, 'meta.txt'), 'w') as f:
-            f.write(str(meta['num_images']) + '\n')
-            f.write(str(meta['width']) + '\n')
-            f.write(str(meta['height']))
-
     def write_paths(paths):
         with open(paths_file, 'w') as f:
             f.write(paths[0])
@@ -1023,6 +1010,18 @@ def standalone_benchmark(video, tests):
             elapsed = timings['total']
         return elapsed, timings
 
+    video_path = video['path']
+    table_name = 'test_video'
+    with make_db() as db:
+        [table], f = db.ingest_videos([(table_name, video_path)], force=True)
+        assert(len(f) == 0)
+        table_id = table.id()
+        column_id = -1
+        for c in table.column_names():
+            if c == 'frame':
+                column_id = table.column(c).id()
+        assert column_id != -1
+
     bmp_template = "ffmpeg -i {input} -start_number 0 {output}/frame%07d.bmp"
     jpg_template = "ffmpeg -i {input} -start_number 0 {output}/frame%07d.jpg"
 
@@ -1065,6 +1064,16 @@ def standalone_benchmark(video, tests):
             stride = sampling[1]
             frames = video_frames / stride
             decode_type = 'strided'
+        elif sampling_type == 'keyframe':
+            decode_type = 'gather'
+            keyframes_list = table.column('frame').keyframes()
+            gather_path = '/tmp/gather_path.txt'
+            os.system('rm -f {:s}'.format(gather_path))
+            with open(gather_path, 'w') as f:
+                for k in keyframes_list:
+                    f.write(str(k) + '\n')
+            decode_args = gather_path
+
 
         print('decode_args', decode_args)
         os.system('rm -rf {}'.format(test_output_dir))
@@ -1146,6 +1155,8 @@ def scanner_benchmark(video, tests):
         'gather_gpu': decode_gpu,
         'range_cpu': decode_cpu,
         'range_gpu': decode_gpu,
+        'keyframe_cpu': decode_cpu,
+        'keyframe_gpu': decode_gpu,
         # 'join_cpu': join_cpu,
         # 'join_gpu': join_gpu,
 
@@ -1190,10 +1201,14 @@ def scanner_benchmark(video, tests):
         results[name] = []
 
         # Parse sampling
-        task_size = settings['task_size']
+        io_packet_size = settings['io_packet_size']
         # Parse settings
         opts = settings
-        opts['work_item_size'] = 256 if is_gpu else 64
+        work_packet_size = 256 if is_gpu else 64
+        if work_packet_size > io_packet_size:
+            work_packet_size = io_packet_size
+        opts['work_packet_size'] = work_packet_size
+        opts['io_packet_size'] = io_packet_size
         if 'nodes' in opts:
             master = opts['nodes'][0]
             workers = opts['nodes'][1:]
@@ -1203,37 +1218,49 @@ def scanner_benchmark(video, tests):
         with make_db(master=master, workers=workers) as db:
             print('Running {:s}'.format(name))
 
+            # Instantiate pipeline
+            frame_input = db.ops.FrameInput()
+            sampled_frame_input = frame_input.sample()
+            output_op = db.ops.Output(columns=[ops(sampled_frame_input)])
+
+            # Create jobs with desired sampling
             sampling_type = sampling[0]
             print(sampling)
-
             jobs = []
             frames = 0
             for t_name in [table_name, table_name + '_2',
                            table_name + '_3', table_name + '_4']:
-                table = db.table(t_name).as_op()
+                frame_column = db.table(t_name).column('frame')
                 if sampling_type == 'all':
-                    sampled_input = table.all(task_size=task_size)
+                    sampling_spec = db.sampler.all()
                     frames += total_frames
                 elif sampling_type == 'strided':
-                    sampled_input = table.strided(sampling[1],
-                                                 task_size=task_size)
+                    sampling_spec = db.sampler.strided(sampling[1])
                     frames += total_frames / sampling[1]
                 elif sampling_type == 'gather':
-                    sampled_input = table.gather(sampling[1],
-                                                 task_size=task_size)
+                    sampling_spec = db.sampler.gather(sampling[1])
                     frames += len(sampling[1])
                 elif sampling_type == 'range':
-                    sampled_input = table.ranges(sampling[1],
-                                                 task_size=task_size)
+                    sampling_spec = db.sampler.ranges(sampling[1])
                     frames += sum(e - s for s, e in sampling[1])
+                elif sampling_type == 'keyframe':
+                    keyframes = frame_column.keyframes()
+                    print(t_name)
+                    print(len(keyframes))
+                    sampling_spec = db.sampler.gather(keyframes)
+                    frames += len(keyframes)
                 else:
                     print('Not a valid sampling type:', sampling_type)
                     exit(1)
 
-                frame = sampled_input
-                job = Job(columns=[ops(frame)], name=t_name + '_dummy_output')
+                job = Job(op_args={
+                    frame_input: frame_column,
+                    sampled_frame_input: sampling_spec,
+                    output_op: t_name + '_dummy_output',
+                })
                 jobs.append(job)
-            success, total, prof = run_trial(db, jobs, opts)
+            bulk_job = BulkJob(jobs=jobs, output=output_op)
+            success, total, prof = run_trial(db, bulk_job, opts)
             assert(success)
             stats = prof.statistics()
             prof.write_trace(name + '.trace')
@@ -1345,9 +1372,9 @@ def peak_benchmark(video, tests):
         assert(len(f) == 0)
         table_id = table.id()
         column_id = -1
-        for c in table.columns():
-            if c.name() == 'frame':
-                column_id = c.id()
+        for c in table.column_names():
+            if c == 'frame':
+                column_id = table.column(c).id()
         assert column_id != -1
 
     scanner_video_args = '{:d}:{:d}'.format(table_id, column_id)
@@ -1398,6 +1425,15 @@ def peak_benchmark(video, tests):
                 frames += (e - s)
             decode_args = ','.join(['{:d}:{:d}'.format(s, e)
                                     for s, e in sampling[1]])
+        elif sampling[0] == 'keyframe':
+            decode_type = 'gather'
+            keyframes_list = table.column('frame').keyframes()
+            gather_path = '/tmp/gather_path.txt'
+            os.system('rm -f {:s}'.format(gather_path))
+            with open(gather_path, 'w') as f:
+                for k in keyframes_list:
+                    f.write(str(k) + '\n')
+            decode_args = gather_path
 
         all_results[test_name] = [{
             'results': run_peak_trial('/tmp/peak_videos.txt', op,
@@ -1928,6 +1964,7 @@ VIDEOS = {
             'caffe_all': ('range', [[0, SMALL_FC / 4]]),
             'flow_cpu_all': ('range', [[0, SMALL_FC / 100]]),
             'flow_gpu_all': ('range', [[0, SMALL_FC / 20]]),
+            'keyframe': ('keyframe',),
         }
     },
     'large': {
@@ -1947,6 +1984,7 @@ VIDEOS = {
             #'flow_cpu_all': ('range', [[0, 100]]),
             #'flow_gpu_all': ('range', [[0, LARGE_FC / 10]]),
             'flow_gpu_all': ('range', [[0, 10240 * 8]]),
+            'keyframe': ('keyframe',),
         }
     }
 }
@@ -2085,19 +2123,19 @@ def run_full_comparison(prefix, video, tests, recalculate=True):
 
     write_results = False
     if recalculate:
-        #standalone_results = standalone_benchmark(video, tests)
+        standalone_results = standalone_benchmark(video, tests)
         if write_results:
             write_results('{:s}_standalone_results.json'.format(prefix),
                           standalone_results)
 
-        # results = scanner_benchmark(video, tests)
+        #results = scanner_benchmark(video, tests)
         # for k, v in results.iteritems():
         #     scanner_results[k] = v
         if write_results:
             write_results('{:s}_scanner_results.json'.format(prefix),
                           scanner_results)
 
-        # results = peak_benchmark(video, tests)
+        #results = peak_benchmark(video, tests)
         # for k, v in results.iteritems():
         #     peak_results[k] = v
         if write_results:
@@ -2115,7 +2153,7 @@ def data_loading_benchmarks():
         {'name': 'decode_cpu',
          'sampling': 'all',
          'scanner_settings': {
-             'task_size': 2048,
+             'io_packet_size': 2048,
              'cpu_pool': '32G',
              'pipeline_instances_per_node': 16
          },
@@ -2128,7 +2166,7 @@ def data_loading_benchmarks():
         {'name': 'decode_gpu',
          'sampling': 'all',
          'scanner_settings': {
-             'task_size': 8192,
+             'io_packet_size': 8192,
              'gpu_pool': '2G',
              'pipeline_instances_per_node': 1
          },
@@ -2141,7 +2179,7 @@ def data_loading_benchmarks():
         {'name': 'stride_cpu',
          'sampling': 'strided_short',
          'scanner_settings': {
-             'task_size': 512,
+             'io_packet_size': 512,
              'cpu_pool': '32G',
              'pipeline_instances_per_node': 16
          },
@@ -2154,7 +2192,7 @@ def data_loading_benchmarks():
         {'name': 'stride_gpu',
          'sampling': 'strided_short',
          'scanner_settings': {
-             'task_size': 2048,
+             'io_packet_size': 2048,
              'gpu_pool': '2G',
              'pipeline_instances_per_node': 1
          },
@@ -2168,7 +2206,7 @@ def data_loading_benchmarks():
          'sampling': 'strided_long',
          'scanner_settings': {
              'cpu_pool': '32G',
-             'task_size': 1,
+             'io_packet_size': 1,
              'pipeline_instances_per_node': 16
          },
          'peak_settings': {
@@ -2181,7 +2219,7 @@ def data_loading_benchmarks():
          'sampling': 'strided_long',
          'scanner_settings': {
              'gpu_pool': '4G',
-             'task_size': 1,
+             'io_packet_size': 1,
              'pipeline_instances_per_node': 1
          },
          'peak_settings': {
@@ -2193,7 +2231,7 @@ def data_loading_benchmarks():
         {'name': 'range_cpu',
          'sampling': 'range',
          'scanner_settings': {
-             'task_size': 1024,
+             'io_packet_size': 1024,
              'cpu_pool': '32G',
              'pipeline_instances_per_node': 16
          },
@@ -2206,7 +2244,7 @@ def data_loading_benchmarks():
         {'name': 'range_gpu',
          'sampling': 'range',
          'scanner_settings': {
-             'task_size': 2048,
+             'io_packet_size': 2048,
              'gpu_pool': '2g',
              'pipeline_instances_per_node': 1
          },
@@ -2215,14 +2253,40 @@ def data_loading_benchmarks():
              'evaluators': 1,
              'tt': '',
              'seg': '5',
-         }}
+         }},
+        {'name': 'keyframe_cpu',
+         'sampling': 'keyframe',
+         'scanner_settings': {
+             'io_packet_size': 128,
+             'cpu_pool': '32G',
+             'pipeline_instances_per_node': 16
+         },
+         'peak_settings': {
+             'decoders': 16,
+             'evaluators': 1,
+             'tt': '',
+             'seg': '5',
+         }},
+        {'name': 'keyframe_gpu',
+         'sampling': 'keyframe',
+         'scanner_settings': {
+             'io_packet_size': 2048,
+             'gpu_pool': '2G',
+             'pipeline_instances_per_node': 1
+         },
+         'peak_settings': {
+             'decoders': 1,
+             'evaluators': 1,
+             'tt': '',
+             'seg': '5',
+         }},
     ]
     tests = [
         {'name': 'gather_cpu',
          'sampling': 'strided_long',
          'scanner_settings': {
              'cpu_pool': '32G',
-             'task_size': 1,
+             'io_packet_size': 1,
              'pipeline_instances_per_node': 16
          },
          'peak_settings': {
@@ -2233,15 +2297,28 @@ def data_loading_benchmarks():
          }},
     ]
     tests = [
-        {'name': 'decode_cpu',
-         'sampling': 'all',
+        {'name': 'keyframe_cpu',
+         'sampling': 'keyframe',
          'scanner_settings': {
-             'task_size': 2048,
+             'io_packet_size': 256,
              'cpu_pool': '32G',
              'pipeline_instances_per_node': 16
          },
          'peak_settings': {
              'decoders': 16,
+             'evaluators': 1,
+             'tt': '',
+             'seg': '5',
+         }},
+        {'name': 'keyframe_gpu',
+         'sampling': 'keyframe',
+         'scanner_settings': {
+             'io_packet_size': 1024,
+             'gpu_pool': '2G',
+             'pipeline_instances_per_node': 1
+         },
+         'peak_settings': {
+             'decoders': 1,
              'evaluators': 1,
              'tt': '',
              'seg': '5',
@@ -2252,8 +2329,10 @@ def data_loading_benchmarks():
     # gather
     # range
     # join
+    recalculate = True
     video_name = 'large'
-    results = run_full_comparison('loading', VIDEOS[video_name], tests, False)
+    results = run_full_comparison('loading', VIDEOS[video_name], tests,
+                                  recalculate)
     pprint(results)
 
     ops = ['decode_cpu',

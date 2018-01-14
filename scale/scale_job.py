@@ -160,7 +160,7 @@ def main(dataset, workload, num_workers):
             numpy.random.seed(1234)
             shot_interval_mean = 600
             shot_interval_stddev = 150
-            num_shots = 3
+            num_shots = 2
             total_frames = 0
             for n in valid_names:
                 vid_frames = db.table(n).num_rows()
