@@ -1219,10 +1219,13 @@ def scanner_benchmark(video, tests):
         io_packet_size = settings['io_packet_size']
         # Parse settings
         opts = settings
-        work_packet_size = 256 if is_gpu else 64
-        if work_packet_size > io_packet_size:
-            work_packet_size = io_packet_size
-        opts['work_packet_size'] = work_packet_size
+        if 'work_packet_size' not in settings:
+            work_packet_size = 256 if is_gpu else 64
+            if work_packet_size > io_packet_size:
+                work_packet_size = io_packet_size
+            opts['work_packet_size'] = work_packet_size
+        else:
+            opts['work_packet_size'] = settings['work_packet_size']
         opts['io_packet_size'] = io_packet_size
         if 'nodes' in opts:
             master = opts['nodes'][0]
@@ -2432,11 +2435,11 @@ def micro_apps_benchmarks():
         {'name': 'caffe',
          'sampling': 'caffe_all',
          'scanner_settings': {
-             'task_size': 2048,
-             'work_item_size': 128,
-             'gpu_pool': '5G',
+             'io_packet_size': 960,
+             'work_packet_size': 96,
+             'gpu_pool': '6G',
              'pipeline_instances_per_node': 1,
-             'tasks_in_queue_per_pu': 2
+             'tasks_in_queue_per_pu': 2,
          },
          'peak_settings': {
              'decoders': 1,
@@ -2487,8 +2490,9 @@ def micro_apps_benchmarks():
         #      'seg': '5',
         #  }},
     ]
+
     video_name = 'large'
-    results = run_full_comparison('micro', VIDEOS[video_name], tests, False)
+    results = run_full_comparison('micro', VIDEOS[video_name], tests, True)
     pprint(results)
 
     ops = ['histogram_cpu',

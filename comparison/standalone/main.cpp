@@ -34,11 +34,30 @@
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/core/cuda_stream_accessor.hpp>
+#include "generator_genfiles/caffe_input_transformer_gpu/caffe_input_transformer_gpu.h"
+#include "HalideRuntimeCuda.h"
 #endif
+#include "generator_genfiles/caffe_input_transformer_cpu/caffe_input_transformer_cpu.h"
 
 #include <iostream>
 #include <fstream>
 #include <thread>
+
+
+// #include "HalideRuntimeCuda.h"
+// #include "scanner/util/halide_context.h"
+// #include "stdlib/caffe/caffe_input_kernel.h"
+
+namespace Halide {
+namespace Runtime {
+namespace Internal {
+namespace Cuda {
+CUcontext context = 0;
+}
+}
+}
+}
+
 
 namespace po = boost::program_options;
 namespace cvc = cv::cuda;
@@ -55,6 +74,7 @@ int FRAMES = 0;
 int STRIDE = 1;
 std::vector<std::string> PATHS;
 int GPUS_PER_NODE = 1;           // GPUs to use per node
+bool GPU = false;
 
 std::map<std::string, double> TIMINGS;
 
@@ -644,7 +664,7 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
   cv::cuda::setDevice(gpu_device_id);
 
   cv::Ptr<cv::cudacodec::VideoReader> video;
-  cv::Ptr<cvc::DenseOpticalFlow> flow = 
+  cv::Ptr<cvc::DenseOpticalFlow> flow =
           cvc::FarnebackOpticalFlow::create(3, 0.5, false, 15, 3, 5, 1.2, 0);
   while (true) {
     int64_t work_item_index;
@@ -739,7 +759,34 @@ void video_flow_gpu_worker(int gpu_device_id, Queue<int64_t>& work_items) {
   TIMINGS["save"] = save_time;
 }
 
-void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
+void set_halide_buf(buffer_t& halide_buf, uint8_t* buf, size_t size) {
+  if (GPU) {
+    halide_buf.dev = (uintptr_t) nullptr;
+
+    // "You likely want to set the dev_dirty flag for correctness. (It will
+    // not matter if all the code runs on the GPU.)"
+    halide_buf.dev_dirty = true;
+
+    i32 err =
+      halide_cuda_wrap_device_ptr(nullptr, &halide_buf, (uintptr_t)buf);
+    assert(err == 0);
+
+    // "You'll need to set the host field of the buffer_t structs to
+    // something other than nullptr as that is used to indicate bounds query
+    // calls" - Zalman Stern
+    halide_buf.host = (uint8_t*)0xdeadbeef;
+  } else {
+    halide_buf.host = buf;
+  }
+}
+
+void unset_halide_buf(buffer_t& halide_buf) {
+  if (GPU) {
+    halide_cuda_detach_device_ptr(nullptr, &halide_buf);
+  }
+}
+
+void video_caffe_worker_cpu(int gpu_device_id, Queue<int64_t>& work_items) {
   double load_time = 0;
   double transform_time = 0;
   double net_time = 0;
@@ -750,10 +797,7 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
   descriptor = descriptor_from_net_file(NET_PATH);
 
   // Set ourselves to the correct GPU
-  cv::cuda::setDevice(gpu_device_id);
-  cudaSetDevice(gpu_device_id);
-  caffe::Caffe::set_mode(caffe::Caffe::GPU);
-  caffe::Caffe::SetDevice(gpu_device_id);
+  caffe::Caffe::set_mode(caffe::Caffe::CPU);
   std::unique_ptr<caffe::Net<float>> net;
   net.reset(new caffe::Net<float>(descriptor.model_path, caffe::TEST));
   net->CopyTrainedLayersFrom(descriptor.model_weights_path);
@@ -765,23 +809,72 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
           input_blob->shape(3)});
   net->Forward();
 
+
   // const boost::shared_ptr<caffe::Blob<float>> output_blob{
   //   net.blob_by_name(net_descriptor.output_layer_name)};
 
   int net_input_width = input_blob->shape(2); // width
   int net_input_height = input_blob->shape(3); // height
 
-  // Setup caffe batch transformer
-  caffe::TransformationParameter param;
-  std::vector<float>& mean_colors = descriptor.mean_colors;
-  param.set_force_color(true);
-  if (descriptor.normalize) {
-    param.set_scale(1.0 / 255.0);
-  }
-  for (int i = 0; i < mean_colors.size(); i++) {
-    param.add_mean_value(mean_colors[i]);
-  }
-  caffe::DataTransformer<float> transformer(param, caffe::TEST);
+  auto transform_halide = [&] (const uint8_t* input_buffer, uint8_t* output_buffer, i32 frame_width, i32 frame_height) {
+    size_t net_input_size =
+      net_input_width * net_input_height * 3 * sizeof(float);
+
+    buffer_t input_buf = {0}, output_buf = {0};
+
+    set_halide_buf(input_buf, const_cast<uint8_t*>(input_buffer),
+                   frame_width * frame_height * 3);
+    set_halide_buf(output_buf, output_buffer, net_input_size);
+
+    // Halide has the input format x * stride[0] + y * stride[1] + c * stride[2]
+    // input_buf.host = input_buffer;
+    input_buf.stride[0] = 3;
+    input_buf.stride[1] = frame_width * 3;
+    input_buf.stride[2] = 1;
+    input_buf.extent[0] = frame_width;
+    input_buf.extent[1] = frame_height;
+    input_buf.extent[2] = 3;
+    input_buf.elem_size = 1;
+
+    // Halide conveniently defaults to a planar format, which is what Caffe
+    // expects
+    output_buf.host = output_buffer;
+    output_buf.stride[0] = 1;
+    output_buf.stride[1] = net_input_width;
+    output_buf.stride[2] = net_input_width * net_input_height;
+    output_buf.extent[0] = net_input_width;
+    output_buf.extent[1] = net_input_height;
+    output_buf.extent[2] = 3;
+    output_buf.elem_size = 4;
+
+    decltype(caffe_input_transformer_cpu)* func;
+    if (GPU) {
+      func = caffe_input_transformer_gpu;
+    } else {
+      func = caffe_input_transformer_cpu;
+    }
+    int error =
+      func(&input_buf, frame_width, frame_height, net_input_width,
+           net_input_height, descriptor.normalize, descriptor.mean_colors[2],
+           descriptor.mean_colors[1], descriptor.mean_colors[0], &output_buf);
+    assert(error == 0);
+
+    unset_halide_buf(input_buf);
+    unset_halide_buf(output_buf);
+  };
+
+
+  // // Setup caffe batch transformer
+  // caffe::TransformationParameter param;
+  // std::vector<float>& mean_colors = descriptor.mean_colors;
+  // param.set_force_color(true);
+  // if (descriptor.normalize) {
+  //   param.set_scale(1.0 / 255.0);
+  // }
+  // for (int i = 0; i < mean_colors.size(); i++) {
+  //   param.add_mean_value(mean_colors[i]);
+  // }
+  // caffe::DataTransformer<float> transformer(param, caffe::TEST);
 
   cv::VideoCapture video;
   while (true) {
@@ -818,8 +911,7 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
         bool valid_frame = video.read(input);
         load_time += scanner::nano_since(load_start);
         if (!valid_frame) {
-          done = true;
-          break;
+          assert(false);
         }
         assert(input.data != nullptr);
         auto transform_start = scanner::now();
@@ -840,8 +932,14 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
                            input_blob->shape(3)});
 
       auto transform_start = scanner::now();
-      transformer.Transform(images, input_blob.get());
-      transform_time += scanner::nano_since(transform_start);
+      float* input_buffer = input_blob->mutable_cpu_data();
+      size_t offset = 0;
+      for (auto& img : images) {
+        transform_halide((uint8_t*)img.data, (uint8_t*)(input_buffer + offset), width, height);
+        offset += input_blob->shape(1) * input_blob->shape(2) * input_blob->shape(3);
+      }
+      // transformer.Transform(images, input_blob.get());
+      // transform_time += scanner::nano_since(transform_start);
       eval_time += scanner::nano_since(transform_start);
 
       auto net_start = scanner::now();
@@ -858,6 +956,192 @@ void video_caffe_worker(int gpu_device_id, Queue<int64_t>& work_items) {
 
       frame += batch;
       save_time += scanner::nano_since(save_start);
+
+      if (frame >= num_frames) {
+        done = true;
+        break;
+      }
+    }
+    outfile.close();
+    TIMINGS["total"] = scanner::nano_since(start_time);
+  }
+  TIMINGS["load"] = load_time;
+  TIMINGS["transform"] = transform_time;
+  TIMINGS["net"] = net_time;
+  TIMINGS["eval"] = eval_time;
+  TIMINGS["save"] = save_time;
+}
+
+
+void video_caffe_worker_gpu(int gpu_device_id, Queue<int64_t>& work_items) {
+  double load_time = 0;
+  double transform_time = 0;
+  double net_time = 0;
+  double eval_time = 0;
+  double save_time = 0;
+
+  NetDescriptor descriptor;
+  descriptor = descriptor_from_net_file(NET_PATH);
+
+  // Set ourselves to the correct GPU
+  cv::cuda::setDevice(gpu_device_id);
+  cudaSetDevice(gpu_device_id);
+  caffe::Caffe::set_mode(caffe::Caffe::GPU);
+  caffe::Caffe::SetDevice(gpu_device_id);
+  halide_set_gpu_device(gpu_device_id);
+  std::unique_ptr<caffe::Net<float>> net;
+  net.reset(new caffe::Net<float>(descriptor.model_path, caffe::TEST));
+  net->CopyTrainedLayersFrom(descriptor.model_weights_path);
+
+  const boost::shared_ptr<caffe::Blob<float>> input_blob{
+    net->blob_by_name(descriptor.input_layer_names[0])};
+
+  input_blob->Reshape({BATCH_SIZE, input_blob->shape(1), input_blob->shape(2),
+          input_blob->shape(3)});
+  net->Forward();
+
+  // const boost::shared_ptr<caffe::Blob<float>> output_blob{
+  //   net.blob_by_name(net_descriptor.output_layer_name)};
+
+  int net_input_width = input_blob->shape(2); // width
+  int net_input_height = input_blob->shape(3); // height
+
+  auto transform_halide = [&] (const uint8_t* input_buffer, uint8_t* output_buffer, i32 frame_width, i32 frame_height) {
+    size_t net_input_size =
+      net_input_width * net_input_height * 3 * sizeof(float);
+
+    buffer_t input_buf = {0}, output_buf = {0};
+
+    set_halide_buf(input_buf, const_cast<uint8_t*>(input_buffer),
+                   frame_width * frame_height * 3);
+    set_halide_buf(output_buf, output_buffer, net_input_size);
+
+    // Halide has the input format x * stride[0] + y * stride[1] + c * stride[2]
+    // input_buf.host = input_buffer;
+    input_buf.stride[0] = 3;
+    input_buf.stride[1] = frame_width * 3;
+    input_buf.stride[2] = 1;
+    input_buf.extent[0] = frame_width;
+    input_buf.extent[1] = frame_height;
+    input_buf.extent[2] = 3;
+    input_buf.elem_size = 1;
+
+    // Halide conveniently defaults to a planar format, which is what Caffe
+    // expects
+    output_buf.host = output_buffer;
+    output_buf.stride[0] = 1;
+    output_buf.stride[1] = net_input_width;
+    output_buf.stride[2] = net_input_width * net_input_height;
+    output_buf.extent[0] = net_input_width;
+    output_buf.extent[1] = net_input_height;
+    output_buf.extent[2] = 3;
+    output_buf.elem_size = 4;
+
+    decltype(caffe_input_transformer_cpu)* func;
+    if (GPU) {
+      func = caffe_input_transformer_gpu;
+    } else {
+      func = caffe_input_transformer_cpu;
+    }
+    int error =
+      func(&input_buf, frame_width, frame_height, net_input_width,
+           net_input_height, descriptor.normalize, descriptor.mean_colors[2],
+           descriptor.mean_colors[1], descriptor.mean_colors[0], &output_buf);
+    assert(error == 0);
+
+    unset_halide_buf(input_buf);
+    unset_halide_buf(output_buf);
+  };
+
+  // // Setup caffe batch transformer
+  // caffe::TransformationParameter param;
+  // std::vector<float>& mean_colors = descriptor.mean_colors;
+  // param.set_force_color(true);
+  // if (descriptor.normalize) {
+  //   param.set_scale(1.0 / 255.0);
+  // }
+  // for (int i = 0; i < mean_colors.size(); i++) {
+  //   param.add_mean_value(mean_colors[i]);
+  // }
+  // caffe::DataTransformer<float> transformer(param, caffe::TEST);
+
+  cv::Ptr<cv::cudacodec::VideoReader> video;
+  while (true) {
+    int64_t work_item_index;
+    work_items.pop(work_item_index);
+
+    if (work_item_index == -1) {
+      break;
+    }
+
+    const std::string& path = PATHS[work_item_index];
+    video = cv::cudacodec::createVideoReader(path);
+    int width = video->format().width;
+    int height = video->format().height;
+    int num_frames = FRAMES;
+    assert(width != 0 && height != 0);
+
+    std::string out_path = output_path(work_item_index);
+    std::ofstream outfile(out_path,
+                          std::fstream::binary | std::fstream::trunc);
+    assert(outfile.good());
+
+    // Load the first frame
+    auto start_time = scanner::now();
+    std::vector<cv::cuda::GpuMat> images(BATCH_SIZE);
+    int64_t frame = 0;
+    bool done = false;
+    while (!done) {
+      int b = 0;
+      images.resize(BATCH_SIZE);
+      for (b = 0; b < BATCH_SIZE; b++) {
+        auto load_start = scanner::now();
+        if (!video->nextFrame(images[b])) {
+          assert(false);
+        }
+        load_time += scanner::nano_since(load_start);
+        assert(images[b].data != nullptr);
+        assert(images[b].rows == height && images[b].cols == width);
+      }
+      if (b == 0) {
+        continue;
+      }
+
+      int batch = b;
+      images.resize(batch);
+      input_blob->Reshape({batch, input_blob->shape(1), input_blob->shape(2),
+                           input_blob->shape(3)});
+
+      auto transform_start = scanner::now();
+      float* input_buffer = input_blob->mutable_gpu_data();
+      size_t offset = 0;
+      for (auto& img : images) {
+        transform_halide((uint8_t*)img.data, (uint8_t*)(input_buffer + offset), width, height);
+        offset += input_blob->shape(1) * input_blob->shape(2) * input_blob->shape(3);
+      }
+      // transformer.Transform(images, input_blob.get());
+      // transform_time += scanner::nano_since(transform_start);
+      eval_time += scanner::nano_since(transform_start);
+
+      auto net_start = scanner::now();
+      net->Forward();
+      net_time += scanner::nano_since(net_start);
+      eval_time += scanner::nano_since(net_start);
+
+      // Save outputs
+      auto save_start = scanner::now();
+      const boost::shared_ptr<caffe::Blob<float>> output_blob{
+        net->blob_by_name(descriptor.output_layer_names[0])};
+      outfile.write((char*)output_blob->cpu_data(),
+                    output_blob->count() * sizeof(float));
+
+      frame += batch;
+      save_time += scanner::nano_since(save_start);
+
+      if (frame >= num_frames) {
+        done = true;
+        break;
+      }
     }
     outfile.close();
     TIMINGS["total"] = scanner::nano_since(start_time);
@@ -944,8 +1228,11 @@ int main(int argc, char** argv) {
     worker_fn = video_flow_cpu_worker;
   } else if (operation == "flow_gpu") {
     worker_fn = video_flow_gpu_worker;
-  } else if (operation == "caffe") {
-    worker_fn = video_caffe_worker;
+  } else if (operation == "caffe_gpu") {
+    GPU = true;
+    worker_fn = video_caffe_worker_gpu;
+  } else if (operation == "caffe_cpu") {
+    worker_fn = video_caffe_worker_cpu;
   }
 
   // Read in list of video paths

@@ -19,7 +19,7 @@ list(APPEND OPENCV_COMPONENTS cudaarithm cudawarping cudaimgproc cudacodec
   cudaoptflow)
 
 find_package(SaneProtobuf REQUIRED)
-find_package(Boost COMPONENTS thread program_options regex python REQUIRED)
+find_package(Boost COMPONENTS thread program_options regex python system REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS ${OPENCV_COMPONENTS})
 find_package(Caffe REQUIRED)
 find_package(TinyToml REQUIRED)
