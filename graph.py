@@ -311,6 +311,7 @@ def comparison_graphs(name,
                       labels,
                       standalone_results, scanner_results,
                       peak_results,
+                      ticks=None,
                       multi_gpu_results=None,
                       labels_on=True):
 
@@ -357,7 +358,7 @@ def comparison_graphs(name,
             frames = v['frames']
             sec, timings = v['results']
             st_fps = frames / sec
-            p_fps = st_fps if st_fps > p_fps else p_fps
+            p_fps = st_fps 
             if sec == -1:
                 standalone_y.append(0)
                 standalone_fps.append(0)
@@ -369,6 +370,7 @@ def comparison_graphs(name,
             frames = v['frames']
             sec, timings = v['results']
             sc_fps = frames/sec
+            #p_fps = sc_fps if sc_fps > p_fps else p_fps
             if sec == -1:
                 scanner_y.append(0)
                 scanner_fps.append(0)
@@ -390,20 +392,20 @@ def comparison_graphs(name,
         fps.append(scanner_fps)
         fps.append(peak_fps)
 
-        ys.append(standalone_y)
+        #ys.append(standalone_y)
         ys.append(scanner_y)
         print(ys)
 
-        x = np.arange(len(ops)) * 1.4
+        x = np.arange(len(ops))
 
-        variants = ['Baseline', 'Scanner']
+        variants = ['Scanner']
 
-        colors = [NAIVE_COLOR, SCANNER_COLOR, PEAK_COLOR]
+        colors = [SCANNER_COLOR]
 
         if multi_gpu_results:
             i = 1
             y = multi_y
-            xx = x+(i*0.35)
+            xx = x+(i*0.15)
             ax.bar(xx, y, 0.3, align='center', color=SCANNER2_COLOR,
                    edgecolor='none')
             if i == 1:
@@ -415,7 +417,7 @@ def comparison_graphs(name,
                                 ha='center')
 
         for (i, y) in enumerate(ys):
-            xx = x+(i*0.35)
+            xx = x+(i*0.15)
             ax.bar(xx, y, 0.3, align='center', color=colors[i],
                    edgecolor='none')
             if i == 1:
@@ -438,19 +440,14 @@ def comparison_graphs(name,
             plt.legend(['Non-expert', 'Scanner', 'Hand-authored'],
                        loc='upper right')
 
-        ax.set_xticks(x+0.3)
+        ax.set_xticks(x+0.1)
         ax.set_xticklabels(['', '', ''])
         ax.tick_params(width=0)
         ax.xaxis.grid(False)
 
-        if multi_gpu_results:
-            yt = [0, 1, 2, 3, 4]
-            ax.set_ylim([0, 1.1])
-        else:
-            yt = [0.25, 0.5, 0.75, 1.0]
-            ax.set_ylim([0, 1.1])
-        ax.set_yticks(yt)
-        ax.set_yticklabels(['{:.1f}'.format(d) for d in yt])
+        if ticks:
+            ax.set_yticks(ticks)
+            ax.set_yticklabels(['{:.1f}'.format(d) for d in ticks])
         #ax.set_ylim([0, 4.1])
 
 
@@ -579,7 +576,7 @@ def multi_gpu_comparison_graphs(name,
                 ax.annotate("{:d}".format(num_gpus[i]), xy=(xy[0], -0.90),
                             ha='center', annotation_clip=False)
 
-    yt = [0, 2, 4, 8]
+    yt = [0, 2, 4]
     ax.set_yticks(yt)
     ax.set_yticklabels(['{:d}'.format(d) for d in yt])
     ax.set_ylim([0, num_gpus[-1] + 0.2])

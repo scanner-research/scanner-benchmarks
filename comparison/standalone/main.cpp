@@ -924,16 +924,16 @@ int main(int argc, char** argv) {
             << ", operation " << operation << std::endl;
 
   WorkerFn worker_fn;
-  if (operation == "decode_cpu" || operation == "stride_cpu" ||
-      operation == "gather_cpu") {
+  if (operation == "decode_cpu" || operation == "stride_cpu") {
     worker_fn = video_decode_cpu_worker;
-  } else if (operation == "decode_gpu" || operation == "stride_gpu" ||
-             operation == "gather_gpu") {
+  } else if (operation == "decode_gpu" || operation == "stride_gpu") {
     worker_fn = video_decode_gpu_worker;
-  } else if (operation == "range_cpu" ||
+  } else if (operation == "gather_cpu" ||
+             operation == "range_cpu" ||
              operation == "keyframe_cpu") {
     worker_fn = video_decode_range_cpu_worker;
-  } else if (operation == "range_gpu" ||
+  } else if (operation == "gather_gpu" ||
+             operation == "range_gpu" ||
              operation == "keyframe_gpu") {
     worker_fn = video_decode_range_gpu_worker;
   } else if (operation == "histogram_cpu") {
